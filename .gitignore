@@ -9,6 +9,8 @@ __pycache__/
 # env / 本地部署覆盖：可能含明文 provider key，永不入库（docs/plan.md §8.6）
 .env
 .env.*
+# 例外：模板文件只含占位符，无 secret，可入库
+!.env.example
 config/*.local.yaml
 
 # 运行时数据：sqlite(+WAL/-shm)、tool 输出 artifact、每用户 workspace、备份。

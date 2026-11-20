@@ -4,7 +4,7 @@
 > 规则（按 CLAUDE.md）：**每个 TODO 项需要单独审批后才能开工**；批准整体计划 ≠ 批准全部 TODO；一次只实现一个 TODO；实现后立即验证并回写状态。
 >
 > 状态标记：`⬜ 待办` `🔵 进行中` `✅ 完成（含验证）` `⚠️ 受阻`
-> 当前进度：**2 / 81 TODO 完成**（r3.2）。里程碑 14 个；T0.1a、T0.1b 已完成；M0 剩余 T0.2–T0.5。（T0.1c 已撤销，见 ADR-007）
+> 当前进度：**3 / 81 TODO 完成**（r3.3）。里程碑 14 个；T0.1a、T0.1b、T0.2 已完成；M0 剩余 T0.3–T0.5。（T0.1c 已撤销，见 ADR-007）
 >
 > **r2 变更（2026-11-20）**：skills / tools / subagents / MCP / plugins / permissions / hooks 全部改为**随项目版本管理的配置文件**，不入数据库、不提供服务端修改端点、用户不可改（ADR-015）。里程碑由 13 个增至 14 个（新增 M1 配置层），DB 表由 25 张减至 14 张（删除 11 张配置表）。
 >
@@ -415,9 +415,9 @@ SSE 细节：
 |---|---|---|---|
 | T0.1a | **仓库卫生 + 版本下限**（原 T0.1 的前半，已单独批准并完成）：(a) `.gitignore` 补 `config/*.local.yaml`、`/data/`、`*.db`/`*.db-shm`/`*.db-wal`、`web/node_modules/`、`web/.next/`、`web/out/`、`web/next-env.d.ts`、`*.tsbuildinfo`、`.mypy_cache/`、`.ruff_cache/`、`.env.*`。(b) 下限收紧到实际解析版本：`openai>=3.51`（原 `>=1.55`，而 ADR-001/T4.2 的 chunk/usage 归一化按 3.51 语义验证，旧版会静默产出错误 ModelEvent）、`fastapi>=0.163`、`uvicorn[standard]>=0.54` + 注释说明"下限=实际解析版本"的约定。(c) `uv lock` | ✅ 已验证：`git check-ignore -v` 对 `data/vanilla.db`、`data/artifacts/…`、`config/settings.local.yaml`、`web/node_modules/…`、`web/.next/…`、`*.db`、`.venv`、`__pycache__` 共 8 条全部命中；`git add -A --dry-run` 首次提交仅 6 文件（无 .venv/data/db）；`uv lock` 解析不变（37 包，openai 仍 3.51.0）；`uv sync` clean | ✅ |
 | T0.1b | **依赖新增**：`pydantic-settings>=2.16.3`、`pyyaml>=6.0.3`、`mcp>=2.3.0`；dev 组 `ruff>=0.17.6`/`mypy>=2.4.1`/`pytest-asyncio>=1.5.0`/`pytest-cov>=7.1.0`/`jsonschema>=4.26.0`；`uv lock && uv sync`；顺带补 `pytest-asyncio` 缺失的 `asyncio_mode`/`asyncio_default_fixture_loop_scope`（不配则每次跑测试都脏一条 deprecation warning）。**原计划"不引入 cryptography"这条验证式写错了，已按实情更正**（见 ADR-007 注） | ✅ 已验证：`uv run python -c "import mcp, yaml, pydantic_settings, jsonschema"` 通过（mcp 2.3.0）；`uv run pytest -q` 退出码 **5**（tests/ 仍空，符合预期）且**输出零 warning**；`uv lock --check` 干净；包数 37→61，`fastapi 0.163.1 / starlette 1.10.0 / pydantic 2.14.3 / openai 3.51.0 / uvicorn 0.54.0 / httpx 0.28.1 / anyio 4.16.0` 全部**未被降级**（与 T0.1a 逐一比对）。**T0.1c 已撤销**：import 级守卫在 mcp 上不可执行（见 ADR-007），该传递依赖的影响可接受，不值得单列 TODO | ✅ |
-| T0.2 | `app/core/env.py`：**只放部署相关** env（`DATABASE_PATH, DATA_DIR, CONFIG_DIR, REPO_ROOT, OPENAI_API_KEY, SESSION_*, ALLOW_LOCAL_SANDBOX, CONFIG_ALLOW_LOCAL, SANDBOX_IMAGE`）+ fail-fast 校验；能力参数一律走 `config/*.yaml` | `pytest tests/unit/test_env.py`（缺 key 报错、默认值、路径展开、dev-only 开关识别） | ⬜ |
+| T0.2 | `app/core/env.py`：**只放部署相关** env（`DATABASE_PATH, DATA_DIR, CONFIG_DIR, REPO_ROOT, OPENAI_API_KEY, SESSION_*, ALLOW_LOCAL_SANDBOX, CONFIG_ALLOW_LOCAL, SANDBOX_IMAGE`）+ fail-fast 校验；能力参数一律走 `config/*.yaml` | ✅ 已验证：`app/core/env.py`（pydantic-settings，10 个 env 白名单 `DEPLOY_ENV_VARS`，`load_env()` 一次性收集全部错误且不回显变量值；`@lru_cache` 单例 —— env 每进程只读一次，SIGHUP reload 只换 ConfigSnapshot 不换 EnvSettings；模型 `frozen=True`，共享实例不可被消费方改写）。`pytest tests/unit/test_env.py` **29 passed**：缺 key / 空 key 报错、缓存单例与不可变性语义（成功被 memoize、失败不入缓存、显式 clear 才重读、赋值即 ValidationError）、仅给 key 时的全套默认值、`~` 展开 + 相对路径锚定 `REPO_ROOT` + `DATABASE_PATH` 跟随 `DATA_DIR`、dev-only 开关（`1/true/yes/on` 与 `0/false/no/off` 识别、垃圾值拒绝）、`SESSION_TTL_DAYS` 边界；护栏用例钉死字段白名单 = 部署面（含"无 `SESSION_SECRET`"与"能力参数不在 env"两条否定断言）。`ruff check` / `ruff format --check` / `mypy app` 全绿。**注**：`PUBLIC_BASE_URL` 在 §11 属部署面但不在 T0.2 列表，随其消费者（M3/M5）落地时再加 | ✅ |
 | T0.3 | 基础设施：`core/ids.py`(单调 UUID)、`core/clock.py`(可注入时钟)、`core/errors.py`(AppError 层级 + handler)、`core/logging.py`(结构化 JSON + request id) | 单测覆盖 id 单调性、错误码映射、日志字段 | ⬜ |
-| T0.4 | `Makefile`：`lint`(ruff check+format --check, mypy app, config-check)、`test`、`dev`、`config-check`、`sandbox-build`、`gen-ts`。`test` 目标要能容忍"暂无测试"阶段（`pytest -q \|\| [ $$? -eq 5 ]`），但一旦 `tests/` 非空就必须以真实结果判定。**另加 `tests/unit/test_repo_hygiene.py`**：把 T0.1a 的 `.gitignore` 断言固化成用例（逐路径 `git check-ignore`，并断言 `/data`、`*.db`、`config/*.local.yaml`、`web/node_modules` 不可能被跟踪），防止将来有人"顺手"放宽 | `make lint` 全绿；`make test` 在空 `tests/` 下退出 0；手动放一个失败用例后 `make test` 退出非 0；故意改坏 `.gitignore` 时 hygiene 用例失败 | ⬜ |
+| T0.4 | `Makefile`：`lint`(ruff check+format --check, mypy app, config-check)、`test`、`dev`、`config-check`、`sandbox-build`、`gen-ts`。`test` 目标要能容忍"暂无测试"阶段（`pytest -q \|\| [ $$? -eq 5 ]`），但一旦 `tests/` 非空就必须以真实结果判定。**另加 `tests/unit/test_repo_hygiene.py`**：把 T0.1a 的 `.gitignore` 断言固化成用例（逐路径 `git check-ignore`，并断言 `/data`、`*.db`、`config/*.local.yaml`、`web/node_modules` 不可能被跟踪；**同时钉死 `.env.example` 可跟踪而 `.env`/`.env.local` 被忽略**——`.gitignore` 里的 `!.env.example` 反选防止将来"顺手放宽"被反向误删），防止将来有人"顺手"放宽 | `make lint` 全绿；`make test` 在空 `tests/` 下退出 0；手动放一个失败用例后 `make test` 退出非 0；故意改坏 `.gitignore` 时 hygiene 用例失败 | ⬜ |
 | T0.5 | `docs/architecture.md`：抽取 §3/§4/§7/§8 的稳定描述（契约、协议、不变量、配置面） | 人工评审 | ⬜ |
 
 ### M1 配置层（config-as-code，ADR-015 落地）
@@ -597,6 +597,7 @@ docker compose up   # 生产形态：service + web（config 目录只读挂载�
 关键 env（部署面）：`OPENAI_API_KEY`、`SECRET_*`（供配置里 `${env:}` 引用）、`SESSION_COOKIE_SECURE`、`SESSION_TTL_DAYS`、`ALLOW_LOCAL_SANDBOX`、`CONFIG_ALLOW_LOCAL`、`SANDBOX_IMAGE`、`PUBLIC_BASE_URL`、`CONFIG_DIR`/`REPO_ROOT`。
 **没有 `SECRET_MASTER_KEY`**（r1 里为 per-user secret 表加密而设，配置不入库后不再需要）。
 **也没有 `SESSION_SECRET` / cookie signing key** —— ADR-004 的会话是 opaque `token_urlsafe(32)` + DB 存 sha256 的**查表式**校验，不存在需要 HMAC 签名的载荷；T0.2 的 fail-fast 列表里不得出现它（曾经的 r2 初稿写了这条，属于设计自相矛盾，已删）。
+**T0.2 已落地**：部署面 env 的读取收口在 `app/core/env.py`（字段白名单由 `tests/unit/test_env.py` 钉死）；上表中的 `PUBLIC_BASE_URL` 待其消费者出现时再加入。仓库根 `.env.example` 模板已提前落地（原属 T13.6 交付项；T0.4 的 hygiene 用例负责钉死"模板可跟踪、真值被忽略"）。
 
 ---
 
@@ -671,4 +672,5 @@ docker compose up   # 生产形态：service + web（config 目录只读挂载�
 - **2026-11-20 r3**：六项开放问题定案（§13.1 D1–D6）。provider 仅 `base_url`/`api_key`/`model_name` + 通用参数、不接 Azure（ADR-001）；凭据全局一把（§8.10）；**开放注册且无 admin 角色**（ADR-004、§6、§7、§8.2、§8.11）；`session` 授权维持 thread 内（D4）；容器网络三档可配（D5）；配置变更维持"建议片段"（D6）。运维动作改走 shell（SIGHUP + CLI），用户侧新增脱敏 `GET /capabilities`。
 - **2026-11-20 r3.1（D8）**：沙箱网络**缺省档定为 `none`**（§5、§8.4、T1.5 / T6.3 / T6.4 / T6.6 / T13.7③）。连带三条要求：镜像预烘焙工具链、网络失败可读化、必须有一条"全程无网冒烟"。§13 重组为 13.1 / 13.2 / 13.3。
 - **2026-11-20 r3.2**：清除本文中的部署环境指纹与决策过程叙述，§14 重写为本变更索引；相应规则写入 CLAUDE.md。
-- **待办**：M0 剩余 T0.2–T0.5；开放问题见 §13.2。
+- **2026-11-20 r3.3 / T0.2 ✅**：`app/core/env.py` 部署面 env 收口（白名单 + fail-fast + 路径锚定 `REPO_ROOT` + `.env` 装载）。验证见 T0.2 行。
+- **待办**：M0 剩余 T0.3–T0.5；开放问题见 §13.2。
