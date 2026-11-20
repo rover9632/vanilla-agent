@@ -4,7 +4,7 @@
 > 规则（按 CLAUDE.md）：**每个 TODO 项需要单独审批后才能开工**；批准整体计划 ≠ 批准全部 TODO；一次只实现一个 TODO；实现后立即验证并回写状态。
 >
 > 状态标记：`⬜ 待办` `🔵 进行中` `✅ 完成（含验证）` `⚠️ 受阻`
-> 当前进度：**1 / 81 TODO 完成**（r2.2）。里程碑 14 个；T0.1a 已实现并验证，等待 **T0.1b** 批准。
+> 当前进度：**2 / 82 TODO 完成**（r2.3）。里程碑 14 个；T0.1a、T0.1b 已实现并验证；等待 **T0.1c** 批准（M0 剩余：T0.1c、T0.2–T0.5）。
 >
 > **r2 变更（2026-11-20）**：skills / tools / subagents / MCP / plugins / permissions / hooks 全部改为**随项目版本管理的配置文件**，不入数据库、不提供服务端修改端点、用户不可改（ADR-015）。里程碑由 13 个增至 14 个（新增 M1 配置层），DB 表由 25 张减至 14 张（删除 11 张配置表）。
 
@@ -53,7 +53,7 @@
 | ADR-004 | **多用户 + cookie session**（用户选定） | `users`/`sessions` 表、HttpOnly `SameSite=Lax` cookie + double-submit CSRF token、口令用 stdlib `hashlib.scrypt`（零依赖、memory-hard）、role `admin`/`member`、**thread/消息/用量按用户隔离**。代价：配置是全局共享的，用户只能"用"能力不能"配"能力（ADR-015）；per-user 配额只能由运维用 CLI 脚本调整。 |
 | ADR-005 | **Docker 沙箱执行**（用户选定） | 每 workspace 一个**长生命周期**容器（保留 cwd/env/已装包等状态），命令走 `docker exec`；默认 `--network none`、`--cap-drop ALL`、`no-new-privileges`、`--memory/--cpus/--pids-limit`、`--tmpfs /tmp`、idle TTL 回收；用 container **label** 而非 name 做重启对账。经 `asyncio` 子进程调 `docker` CLI（探测：Docker 29.8.1 / cgroup v2 可用），**不引入 docker-py**。 |
 | ADR-006 | **文件工具在 host 侧操作 bind mount 目录** | 与容器 `/work` 是同一份字节，host 侧 realpath 约束即可，比每次 `docker exec cat` 快且好测；bash/脚本类留在容器内。 |
-| ADR-007 | **MCP 用官方 `mcp` SDK**（用户选定）+ 自写 adapter | 协议生命周期（initialize/tools·list/tools·call/elicitation/sampling）由成熟实现负责；我们只做 `MCPBridge → ToolRegistry` 的命名与权限映射 `mcp__<server>__<tool>`。**server 清单来自 `config/mcp.yaml`，工具目录只在内存里**（启动时 connect + `tools/list`，不入库）。 |
+| ADR-007 | **MCP 用官方 `mcp` SDK**（用户选定）+ 自写 adapter | 协议生命周期（initialize/tools·list/tools·call/elicitation/sampling）由成熟实现负责；我们只做 `MCPBridge → ToolRegistry` 的命名与权限映射 `mcp__<server>__<tool>`。**server 清单来自 `config/mcp.yaml`，工具目录只在内存里**（启动时 connect + `tools/list`，不入库）。**依赖足迹（T0.1b 实测）**：`mcp 2.3.0` 拉入 `pyjwt[crypto]`→`cryptography`、`httpx2`、`opentelemetry-api`、`sse-starlette`、`python-multipart`、`jsonschema`、`mcp-types` 等（包数 37→61）。两条硬约束：(a) **只用 client 侧**，禁止 import `mcp.server.*`（其 request state 用 AESGCM 自加密，会引入一把我们不想管的密钥）；(b) `cryptography` 只能作为传递依赖存在，不得成为直接依赖，也不得被 `app/**` import（守卫见 T0.1c、T0.4）。 |
 | ADR-008 | **Skills / Subagents = Markdown + YAML frontmatter，放在 `config/` 下** | 与 Claude Code 习惯一致，纯文本可版本管理；skill 正文按需注入（progressive disclosure），系统提示只带 name/description/when_to_use。 |
 | ADR-009 | **Permissions = 规则引擎（读自 `config/permissions.yaml`）** | pattern grammar `ToolName` / `ToolName(<principal>)`，效果优先级 **deny > ask > allow**（不看特异性），叠加 mode preset 与 tool 的 `read_only`/`destructive` 默认值。授权范围只保留 **`once` / `session`** 两档：`always` 意味着写配置，与 ADR-015 冲突，改为"复制一段建议规则 YAML 供提交评审"。 |
 | ADR-010 | **Hooks = 外部命令 + 进程内 callable** | 命令型（stdin JSON、stdout JSON、`exit 2` 即 block）安全面小、可跨语言；callable 型只允许来自 **trusted 插件**（in-process 即 service 权限）。声明来源 `config/hooks.yaml` + 插件 manifest。超时策略可配 `on_timeout: block\|allow`。 |
@@ -61,7 +61,7 @@
 | ADR-012 | **HITL = 统一 `interrupt` 表 + run 状态机** | 权限审批 / `ask_user` / plan 审批 / MCP elicitation 共用一套持久化 + `asyncio.Future` + timeout + 重启后可 resolve 的机制。**中断的事实入库（`interrupt` + `event_log`），中断的效果不入库**（`session` 授权只在进程内 TTL 表）。 |
 | ADR-013 | **前端 Next.js（App Router）+ TS + Tailwind，自写 SSE reader**（用户选定 v1 范围：聊天 + 审批） | 需要 POST header（CSRF/session）所以不用原生 `EventSource`，用 `fetch` + `ReadableStream` 自解 SSE 帧；事件类型由后端 pydantic JSON Schema 生成 TS，避免手写漂移。 |
 | ADR-014 | **单节点部署** | run 状态在进程内，重启靠 `event_log` + `interrupt` 恢复；跨节点需要外部队列，不在 v1。reload 语义也因此天然是"本进程"。 |
-| **ADR-015** | **config-as-code：装配面 = 仓库文件，DB 只存运行时事实，服务端不接受配置写入**（用户选定） | 一句话原则：**"agent 能做什么"进 git，"agent 做了什么"进 SQLite。** 收益：能力变更天然可评审、可回滚、可 diff；启动即可确定完整能力面（skills/tools/MCP/plugins/hooks/permission rules 全在 `ConfigSnapshot` 里），`config-check` 能在 CI 抓到"skill 引用了被关掉的工具"这类错；DB schema 大幅瘦身（25→14 表），去掉 `cryptography` 依赖与密钥管理；不存在"配置被运行时篡改导致提权"的攻击面（除了文件本身）。代价：改配置要 reload/重启；无法 per-user 定制；provider 花费无法按用户区分（见 §13-Q2）。**新增的信任边界：`config/` 目录的文件权限**（§8.7）。 |
+| **ADR-015** | **config-as-code：装配面 = 仓库文件，DB 只存运行时事实，服务端不接受配置写入**（用户选定） | 一句话原则：**"agent 能做什么"进 git，"agent 做了什么"进 SQLite。** 收益：能力变更天然可评审、可回滚、可 diff；启动即可确定完整能力面（skills/tools/MCP/plugins/hooks/permission rules 全在 `ConfigSnapshot` 里），`config-check` 能在 CI 抓到"skill 引用了被关掉的工具"这类错；DB schema 大幅瘦身（25→14 表），去掉自研 at-rest 加密与主密钥管理（注意：`cryptography` 仍经 `mcp→pyjwt[crypto]` 作为**传递依赖**存在，但不再是我们的直接依赖，也不被 `app/**` 使用 —— 见 ADR-007 / T0.1c）；不存在"配置被运行时篡改导致提权"的攻击面（除了文件本身）。代价：改配置要 reload/重启；无法 per-user 定制；provider 花费无法按用户区分（见 §13-Q2）。**新增的信任边界：`config/` 目录的文件权限**（§8.7）。 |
 
 ---
 
@@ -399,10 +399,11 @@ SSE 细节：
 | ID | TODO | 验证 | 状态 |
 |---|---|---|---|
 | T0.1a | **仓库卫生 + 版本下限**（原 T0.1 的前半，已单独批准并完成）：(a) `.gitignore` 补 `config/*.local.yaml`、`/data/`、`*.db`/`*.db-shm`/`*.db-wal`、`web/node_modules/`、`web/.next/`、`web/out/`、`web/next-env.d.ts`、`*.tsbuildinfo`、`.mypy_cache/`、`.ruff_cache/`、`.env.*`。(b) 下限收紧到实测版本：`openai>=3.51`（原 `>=1.55`，而 ADR-001/T4.2 的 chunk/usage 归一化按 3.51 语义验证，旧版会静默产出错误 ModelEvent）、`fastapi>=0.163`、`uvicorn[standard]>=0.54` + 注释说明"下限=实测版本"的约定。(c) `uv lock` | ✅ 已验证：`git check-ignore -v` 对 `data/vanilla.db`、`data/artifacts/…`、`config/settings.local.yaml`、`web/node_modules/…`、`web/.next/…`、`*.db`、`.venv`、`__pycache__` 共 8 条全部命中；`git add -A --dry-run` 首次提交仅 6 文件（无 .venv/data/db）；`uv lock` 解析不变（37 包，openai 仍 3.51.0）；`uv sync` clean | ✅ |
-| T0.1b | **依赖新增**：`pydantic-settings`、`pyyaml`、`mcp`；dev 组 `ruff`/`mypy`/`pytest-asyncio`/`pytest-cov`/`jsonschema`；**不引入 `cryptography`**（配置不入库 → 无需 at-rest 加密）。`uv lock && uv sync` | `uv run python -c "import mcp, yaml, pydantic_settings"`；`uv run pytest -q` **退出码 0 或 5**（`tests/` 尚空时 pytest 以 5 "no tests ran" 结束，不能当作失败）；`grep -c 'name = "cryptography"' uv.lock` = 0 | ⬜ |
+| T0.1b | **依赖新增**：`pydantic-settings>=2.16.3`、`pyyaml>=6.0.3`、`mcp>=2.3.0`；dev 组 `ruff>=0.17.6`/`mypy>=2.4.1`/`pytest-asyncio>=1.5.0`/`pytest-cov>=7.1.0`/`jsonschema>=4.26.0`；`uv lock && uv sync`；顺带补 `pytest-asyncio` 缺失的 `asyncio_mode`/`asyncio_default_fixture_loop_scope`（不配则每次跑测试都脏一条 deprecation warning）。**原计划"不引入 cryptography"这条写错了，已按实情更正**（见下） | ✅ 实测：`uv run python -c "import mcp, yaml, pydantic_settings, jsonschema"` 通过（mcp 2.3.0）；`uv run pytest -q` 退出码 **5**（tests/ 仍空，符合预期）且**输出零 warning**；`uv lock --check` 干净；包数 37→61，`fastapi 0.163.1 / starlette 1.10.0 / pydantic 2.14.3 / openai 3.51.0 / uvicorn 0.54.0 / httpx 0.28.1 / anyio 4.16.0` 全部**未被降级**（与 T0.1a 逐一比对） | ✅ |
+| T0.1c | **依赖事实更正记录**（由 T0.1b 执行时发现）：`cryptography 50.0.2` **确实进了 `uv.lock`**，但不是我们的直接依赖 —— `mcp 2.3.0` 硬声明 `pyjwt[crypto]>=2.10.1`，且 `mcp/server/request_state.py` 用 AESGCM+HKDF 加密其 server 侧 request state。因此：<br>① ADR-015 "去掉 at-rest 加密"依然成立（我们没有主密钥、没有 Fernet、`pyproject.toml` 不含 `cryptography`，per-user secret 入库的口子仍然关闭）；<br>② 原先的验证式 `grep -c 'name="cryptography"' uv.lock = 0` 是错的（它检查的是"包不存在"而不是"我们不用它"），替换为正向守卫：**`tests/unit/test_repo_hygiene.py` 断言 `app/**` 内无任何 `import cryptography`**，且 `pyproject.toml` 的 `dependencies`/`dev` 列表不含它；<br>③ 明确 **只使用 mcp 的 client 侧**（ADR-007），永不引入 `mcp.server.*` —— 否则要多管一把 SDK 自用的 state key，且与"配置不入库、无密钥管理"的立场冲突 | `tests/unit/test_repo_hygiene.py`：遍历 `service/app/**/*.py` 断言无 `cryptography` / `mcp.server` import；断言 `pyproject.toml` 两个依赖列表不含 `cryptography`；故意在某个模块加一行 `import cryptography` 或用 `from mcp.server import ...` 时该用例必须失败 | ⬜ |
 | T0.2 | `app/core/env.py`：**只放部署相关** env（`DATABASE_PATH, DATA_DIR, CONFIG_DIR, REPO_ROOT, OPENAI_API_KEY, SESSION_*, ALLOW_LOCAL_SANDBOX, CONFIG_ALLOW_LOCAL, SANDBOX_IMAGE`）+ fail-fast 校验；能力参数一律走 `config/*.yaml` | `pytest tests/unit/test_env.py`（缺 key 报错、默认值、路径展开、dev-only 开关识别） | ⬜ |
 | T0.3 | 基础设施：`core/ids.py`(单调 UUID)、`core/clock.py`(可注入时钟)、`core/errors.py`(AppError 层级 + handler)、`core/logging.py`(结构化 JSON + request id) | 单测覆盖 id 单调性、错误码映射、日志字段 | ⬜ |
-| T0.4 | `Makefile`：`lint`(ruff check+format --check, mypy app, config-check)、`test`、`dev`、`config-check`、`sandbox-build`、`gen-ts`。`test` 目标要能容忍"暂无测试"阶段（`pytest -q || [ $$? -eq 5 ]`），但一旦 `tests/` 非空就必须以真实结果判定。**另加 `tests/unit/test_repo_hygiene.py`**：把 T0.1a 的 `.gitignore` 断言固化成用例（逐路径 `git check-ignore`，并断言 `/data`、`*.db`、`config/*.local.yaml`、`web/node_modules` 不可能被跟踪），防止将来有人"顺手"放宽 | `make lint` 全绿；`make test` 在空 `tests/` 下退出 0；手动放一个失败用例后 `make test` 退出非 0；故意改坏 `.gitignore` 时 hygiene 用例失败 | ⬜ |
+| T0.4 | `Makefile`：`lint`(ruff check+format --check, mypy app, config-check)、`test`、`dev`、`config-check`、`sandbox-build`、`gen-ts`。`test` 目标要能容忍"暂无测试"阶段（`pytest -q \|\| [ $$? -eq 5 ]`），但一旦 `tests/` 非空就必须以真实结果判定。**另加 `tests/unit/test_repo_hygiene.py`**：把 T0.1a 的 `.gitignore` 断言固化成用例（逐路径 `git check-ignore`，并断言 `/data`、`*.db`、`config/*.local.yaml`、`web/node_modules` 不可能被跟踪），防止将来有人"顺手"放宽 | `make lint` 全绿；`make test` 在空 `tests/` 下退出 0；手动放一个失败用例后 `make test` 退出非 0；故意改坏 `.gitignore` 时 hygiene 用例失败 | ⬜ |
 | T0.5 | `docs/architecture.md`：抽取 §3/§4/§7/§8 的稳定描述（契约、协议、不变量、配置面） | 人工评审 | ⬜ |
 
 ### M1 配置层（config-as-code，ADR-015 落地）
@@ -414,7 +415,7 @@ SSE 细节：
 | T1.3 | `app/config/snapshot.py`：`ConfigSnapshot`（version/sources sha256/合并后视图）+ `ConfigStore.swap()` 原子替换 + `RunContext.config` 引用旧快照语义 | 单测：reload 前后两个 run 各持自己快照；swap 失败保留旧快照；version 单调 | ⬜ |
 | T1.4 | 合并规则：`plugins/<name>` 资源贡献、`*.local.yaml` 覆盖门控、permission 并集 + deny 优先 + 插件禁声明 bypass、**同名冲突报 error**（skill slug / tool name / mcp server / hook matcher） | 单测：4 类冲突各报一条 error；local 覆盖在未开开关时被忽略 | ⬜ |
 | T1.5 | `config/` 初版：最小可用一套（`settings.yaml` 默认 model + sandbox 限额、`tools.yaml` 关 bash 之外的写类工具、`permissions.yaml` 3 条示例规则、`hooks.yaml`/`mcp.yaml`/`plugins.yaml` 空清单）+ 1 个示例 skill + 1 个示例 agent + `config/README.md` | `make config-check` 通过；快照能列出预期 tools/skills/agents 数 | ⬜ |
-| T1.6 | `make config-check` + `python -m app.config check|dump`（dump 打印合并后的完整能力视图供评审）；`check` 含**明文密钥扫描**与"引用了不存在的工具/server/plugin"检查 | CI 式脚本：故意引用不存在工具 → 非零退出；故意放一个 `sk-` → error | ⬜ |
+| T1.6 | `make config-check` + `python -m app.config check\|dump`（dump 打印合并后的完整能力视图供评审）；`check` 含**明文密钥扫描**与"引用了不存在的工具/server/plugin"检查 | CI 式脚本：故意引用不存在工具 → 非零退出；故意放一个 `sk-` → error | ⬜ |
 | T1.7 | 配置信任边界检查（§8.7）：`config/` 属主/可写性、hook 脚本 world-writable、`CONFIG_ALLOW_LOCAL` 告警；启动与 reload 都执行 | 单测：用 `os.chmod`/tmpdir 构造可写目录 → 拒绝；dev 开关下仅告警 | ⬜ |
 | T1.8 | 只读诊断 API：`GET /config/report`、`GET /tools`、`GET /skills`、`GET /agents`、`GET /plugins`、`GET /mcp/status` + `POST /admin/config/reload`（admin，返回新 version/错误报告） | e2e：非 admin 403；reload 后 report.version 递增；在跑的 run 快照版本不变 | ⬜ |
 
@@ -527,7 +528,7 @@ SSE 细节：
 | ID | TODO | 验证 | 状态 |
 |---|---|---|---|
 | T12.1 | `hooks/types.py` + `bus.py`：事件枚举（SessionStart、UserPromptSubmit、PreToolUse、PostToolUse、PostToolUseFailure、PermissionRequest、PermissionDenied、SubagentStart/Stop、PreCompact/PostCompact、Stop）、matcher、outcome 合并规则（block 优先、modify 串行）、由 snapshot 构建；无 hook 时零开销 | 单测：合并优先级、matcher 命中、零开销路径 | ⬜ |
-| T12.2 | `hooks/command.py`：stdin JSON / stdout JSON / exit 0·2 语义、超时（默认 10s）、`on_timeout: block|allow`、stdout 大小限制、argv 直传不经 shell、脚本路径与可写性校验（§8.7） | 集成：阻断某工具、注入 context、两种超时策略；world-writable 脚本被拒 | ⬜ |
+| T12.2 | `hooks/command.py`：stdin JSON / stdout JSON / exit 0·2 语义、超时（默认 10s）、`on_timeout: block\|allow`、stdout 大小限制、argv 直传不经 shell、脚本路径与可写性校验（§8.7） | 集成：阻断某工具、注入 context、两种超时策略；world-writable 脚本被拒 | ⬜ |
 | T12.3 | hook 接入 loop 各挂点 + `HOOK_*` 事件 + `tool_call`/`audit_log` 记录；PreToolUse deny 时模型收到可理解原因 | e2e：`HOOK_BLOCKED` 出现在流上且模型正确解释 | ⬜ |
 | T12.4 | `plugins/manifest.py` + `discover.py`：`.vanilla-plugin/plugin.json` 校验（name/version/min_service_version/skills/agents/mcpServers/hooks/tools/pythonEntryPoints）、`config/plugins.yaml` 的 enabled/trusted、资源标签归属 | 单测：版本不满足拒装、trusted=false 时忽略 entry point、manifest 引用越界报错 | ⬜ |
 | T12.5 | `plugins/registrar.py` + `loader.py`：`register(registrar)` 协议（add_tool/add_hook/add_skill_source/add_mcp_server），贡献全部进 snapshot；reload = 快照替换，**在跑的 run 不受影响** | 集成：带自定义工具的 fixture 插件；reload 前后同一 run 继续且工具集不变 | ⬜ |
@@ -601,6 +602,7 @@ docker compose up   # 生产形态：service + web（config 目录只读挂载�
 | SSE 断线重放语义错乱 | UI 丢字/重复字 | cursor 全局单调 + 前端按 `(run_id,seq)` 去重 + `Last-Event-ID` 严格重放测试（T5.1） |
 | 权限"自批"漏洞 | 提权 | 无 `always` 档、run 内不写规则文件、resolve 必须带用户身份、session grant 只在内存 + `audit_log`（T7.4/T8.2） |
 | MCP/插件引入任意代码执行 | 服务权限泄漏 | trust 来自 `plugins.yaml`（需评审）+ command hook 无 shell + 脚本可写性校验 + 资源标签审计（T12.4/T12.5） |
+| **mcp SDK 依赖面比规划时估的大**（实测 37→61 包，含 `cryptography`、`pyjwt[crypto]`、`httpx2`、`opentelemetry-api`、`sse-starlette`） | 传递依赖成为长期审计负担；若误用 `mcp.server.*` 会多出"SDK 自用 state key"这把我们要管的密钥，与 ADR-015 冲突 | 只用 client 侧（ADR-007 硬约束）；下限锁 `mcp>=2.3.0`；T0.1c 守卫用例禁止 `app/**` import `cryptography`/`mcp.server`；升级 mcp 时先看 `uv pip tree` 的增量 |
 | prompt injection 通过抓取内容操纵工具 | 外泄/破坏 | §8.5 包裹标记 + 敏感工具默认 ask + SSRF 过滤 + 输出 redact |
 | SQLite 写锁竞争 | 并发 run 下写延迟抖动；等待超过 `busy_timeout=5000ms` 时请求返回 5xx | 单写者 executor + WAL + busy_timeout + delta 批量落库 + per-user 并发上限 |
 | **service 容器挂 `/var/run/docker.sock`** | socket == 宿主 root：service 一旦被攻陷即可起特权容器读走全部用户数据与 `vanilla.db`，§8.4 的跨用户隔离失效 | v1 让 service 跑在宿主机（systemd），compose 只装 web；必须容器化时改用受限 socket 代理 / 独立 rootless daemon（§8.4、T13.6） |
@@ -611,7 +613,7 @@ docker compose up   # 生产形态：service + web（config 目录只读挂载�
 ## 13. 待确认的开放问题
 
 1. **模型与 provider**：默认 model id？是否要接 Azure OpenAI / 自建兼容网关（`base_url` 之外鉴权方式不同，需扩 `settings.yaml`）？→ 影响 T4.2。
-2. **provider 凭据是否只有一把（全局 env）**：r2 之后 per-user API key 无处安放（配置不入库、用户不可改）。若需要按用户计费/隔离，要么接受"配置里有 per-user key 映射文件"（仍是文件），要么重开 per-user secret 入库 → 需要 `cryptography`。→ 影响 M3/M13。
+2. **provider 凭据是否只有一把（全局 env）**：r2 之后 per-user API key 无处安放（配置不入库、用户不可改）。若需要按用户计费/隔离，要么接受"配置里有 per-user key 映射文件"（仍是文件），要么重开 per-user secret 入库。**更新（T0.1b 后）**：`cryptography` 已随 mcp 进入依赖树，所以这条路**不再需要新增依赖**，只需要引入主密钥管理（keyring/KMS/env）——门槛比我原先估的低，但它直接违背 ADR-015 的"配置不入库"，属于要重新决策而非顺手实现的事。→ 影响 M3/M13。
 3. **注册流程**：开放注册 / admin 邀请制（邀请本身是 DB 还是文件？倾向 DB，因为它是"用户记录"不是"能力配置"）/ 仅 `seed_admin.py` 手工建号？→ 影响 T3.3。
 4. **`session` 授权的存活边界**：当前定义为"同一 thread 内、直到进程重启或 reload 失效"。是否改成"登录会话期"或加显式 TTL（如 2h）？→ 影响 T7.4。
 5. **容器网络**：默认 `--network none` 下 `pip install` 不可用。是提供 `settings.yaml` 的 per-run 申请（需 admin 批准 → 但审批对象是运行时不是配置）还是让用户提 PR 到 `settings.yaml`？→ 影响 T6.4。
@@ -644,3 +646,10 @@ docker compose up   # 生产形态：service + web（config 目录只读挂载�
   - 验证结果：`git check-ignore -v` 8 条敏感路径全部命中；`uv lock` 解析未变（37 包，openai 3.51.0），`uv sync` 无变更；`git add -A --dry-run` 显示首次提交只含 6 个文件（`.gitignore`/`CLAUDE.md`/`README.md`/`docs/plan.md`/`pyproject.toml`/`uv.lock`），无 `.venv`、无 db。
   - 刻意没有做的（超出批准范围）：不新增任何依赖、不写 `app/` 代码、不建 `tests/` 用例。`.gitignore` 里 `*.db` 用全局式而非仅 `/data/*.db`，理由与反选口子写在文件注释里；hygiene 守卫用例排入 T0.4（此时才有 `tests/` 可进版本库 —— 空目录 git 不跟踪）。
   - §13-Q9（部署形态）与 Q10（仓库卫生）关闭：service 定为宿主机进程，compose 只装 web，不挂 docker socket。
+- 2026-11-20：**r2.3 —— T0.1b 完成，同时发现并更正了我自己写错的一条事实**。
+  - 改动：`service/pyproject.toml`（新增 `pydantic-settings>=2.16.3`/`pyyaml>=6.0.3`/`mcp>=2.3.0` + dev 组 `ruff>=0.17.6`/`mypy>=2.4.1`/`pytest-asyncio>=1.5.0`/`pytest-cov>=7.1.0`/`jsonschema>=4.26.0`；补 `asyncio_mode="auto"` 与 `asyncio_default_fixture_loop_scope="function"`）、`service/uv.lock`（37→61 包）。下限全部取 `uv add` 解析出的实测值，符合 T0.1a 立的"下限=实测版本"约定。
+  - **我写错的验证式**：T0.1b 原要求 `grep -c 'name = "cryptography"' uv.lock` = 0，实测**不成立** —— `mcp 2.3.0` 硬声明 `pyjwt[crypto]`，把 `cryptography 50.0.2` 带进了树（`mcp/server/request_state.py` 用它做 AESGCM+HKDF）。处理方式不是把断言放宽，而是：承认 ADR-015 的立场仍成立（无主密钥、无 Fernet、非直接依赖），把断言从"包不存在"改成"我们不用它"，并拆出 **T0.1c** 落地为正向守卫（`app/**` 禁 import `cryptography`/`mcp.server` + `pyproject` 两列表禁列 `cryptography`）。同时新增约束"**只用 mcp client 侧**"（ADR-007）与一条风险行（§12）。
+  - 顺带发现：`pytest-asyncio` 装上后未配置就每次运行脏一条 `PytestDeprecationWarning` —— 属于加依赖的应收尾，故在本次一并配好，现在 `pytest -q` 输出**零 warning**、退出码 5（`tests/` 仍空，如 T0.1a 所述空目录不被 git 跟踪）。
+  - 验证记录：导入检查通过；`uv lock --check` 干净；关键包零降级（fastapi 0.163.1 / starlette 1.10.0 / pydantic 2.14.3 / openai 3.51.0 / uvicorn 0.54.0 / httpx 0.28.1 / anyio 4.16.0）。
+  - 纪律：本次没有新增任何 `app/` 代码、没做"顺手"重构、没扩到 T0.2 的配置层。
+  - 工作约定变更：`CLAUDE.md` 新增两条（不改 `.env*`；commit message 不带 attribution）。已按新约定把首个 commit `2cce816` amend 为 `467532d` 去掉 `Co-Authored-By`（仓库未推送，`git reflog` 可回退）。
