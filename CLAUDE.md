@@ -2,6 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+
+## Working agreements (developer's standing rules)
+
+- Never edit `.env` or `.env.local` (secret files); update `.env.example` instead, and never print secret values from them.
+- Commit messages carry NO `Co-Authored-By` or similar attribution trailers.
+
+
 ## Planning and Task Management
 
 1. **Plan Before Implementation**
