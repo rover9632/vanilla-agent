@@ -14,6 +14,9 @@ import pytest
 from pydantic import ValidationError
 
 from app.core.env import (
+    DEFAULT_CONFIG_DIRNAME,
+    DEFAULT_DATA_DIRNAME,
+    DEFAULT_DATABASE_FILENAME,
     DEFAULT_SANDBOX_IMAGE,
     DEFAULT_SESSION_TTL_DAYS,
     DEPLOY_ENV_VARS,
@@ -32,22 +35,29 @@ def load_fresh() -> EnvSettings:
     Failed loads are not memoized (lru_cache only caches successes), so every
     test that changes the environment and expects *fresh* values — including
     second-phase assertions inside a single test — must go through here.
+    `dotenv_path=None` keeps the developer's own `.env` out of the picture.
     """
+    load_env.cache_clear()
+    return load_env(dotenv_path=None)
+
+
+def load_with_dotenv() -> EnvSettings:
+    """Same, but with AUTO_DOTENV: exercises call-time dotenv resolution."""
     load_env.cache_clear()
     return load_env()
 
 
 @pytest.fixture(autouse=True)
 def _isolated_environ(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Strip every deployment var and disable the repo-root `.env`.
+    """Strip every deployment var.
 
-    Without this, the developer's machine environment (or an untracked
-    `.env`) would leak into the expectations below. The cache is cleared on
-    both sides so a success cached by one test can never answer for another.
+    Without this, the developer's machine environment would leak into the
+    expectations below. The dotenv source is separately disabled by
+    load_fresh(); the cache is cleared on both sides so a success cached by
+    one test can never answer for another.
     """
     for name in DEPLOY_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setitem(EnvSettings.model_config, "env_file", None)
     load_env.cache_clear()
     yield
     load_env.cache_clear()
@@ -73,16 +83,16 @@ def test_load_env_is_a_process_singleton(setenv) -> None:
     must receive the same cached instance.
     """
     setenv(OPENAI_API_KEY=VALID_KEY)
-    first = load_env()
+    first = load_env(dotenv_path=None)
     setenv(SESSION_TTL_DAYS="7")
-    assert load_env() is first  # memoized: later env edits are invisible
+    assert load_env(dotenv_path=None) is first  # memoized: env edits invisible
     assert load_fresh().session_ttl_days == 7  # an explicit clear re-reads
 
 
 def test_settings_instance_is_immutable(setenv) -> None:
     """The cached EnvSettings is shared process-wide, so it is frozen."""
     setenv(OPENAI_API_KEY=VALID_KEY)
-    env = load_env()
+    env = load_env(dotenv_path=None)
     with pytest.raises(ValidationError):
         env.session_ttl_days = 1
 
@@ -90,9 +100,9 @@ def test_settings_instance_is_immutable(setenv) -> None:
 def test_failed_loads_are_not_cached(setenv) -> None:
     """lru_cache memoizes successes only: fixing the env recovers without a clear."""
     with pytest.raises(EnvError):
-        load_env()
+        load_env(dotenv_path=None)
     setenv(OPENAI_API_KEY=VALID_KEY)
-    assert load_env().openai_api_key == VALID_KEY
+    assert load_env(dotenv_path=None).openai_api_key == VALID_KEY
 
 
 # --- fail-fast on missing / invalid key --------------------------------------
@@ -186,6 +196,62 @@ def test_database_path_follows_data_dir_override(setenv, tmp_path: Path) -> None
     setenv(OPENAI_API_KEY=VALID_KEY, DATA_DIR=str(tmp_path / "d"))
     env = load_fresh()
     assert env.database_path == tmp_path / "d" / "vanilla.db"
+
+
+# --- path strictness & call-time dotenv resolution (code-review follow-up) --------
+
+
+def test_dotenv_follows_the_runtime_repo_root(setenv, tmp_path: Path) -> None:
+    """Setting REPO_ROOT relocates the .env too (it used to be bound at import)."""
+    (tmp_path / ".env").write_text(f"OPENAI_API_KEY={VALID_KEY}\n", encoding="utf-8")
+    setenv(REPO_ROOT=str(tmp_path))  # deliberately no OPENAI_API_KEY in the env
+    env = load_with_dotenv()
+    assert env.openai_api_key == VALID_KEY
+    assert env.repo_root == tmp_path
+    assert env.data_dir == tmp_path / "data"
+
+
+def test_relative_repo_root_rejected(setenv) -> None:
+    """REPO_ROOT anchors everything; anchoring it at CWD is silent breakage."""
+    setenv(OPENAI_API_KEY=VALID_KEY, REPO_ROOT="relative/x")
+    with pytest.raises(EnvError, match="REPO_ROOT must be an absolute path"):
+        load_fresh()
+
+
+@pytest.mark.parametrize(
+    "var", ["REPO_ROOT", "DATA_DIR", "CONFIG_DIR", "DATABASE_PATH"]
+)
+def test_present_but_blank_path_rejected(setenv, tmp_path: Path, var: str) -> None:
+    """`VAR=` in .env is a typo, not a request for the default (unset is)."""
+    setenv(OPENAI_API_KEY=VALID_KEY, REPO_ROOT=str(tmp_path))
+    setenv(**{var: "   "})
+    with pytest.raises(EnvError, match=f"{var} must not be empty"):
+        load_fresh()
+
+
+def test_unresolvable_tilde_surfaces_as_env_error(setenv, monkeypatch) -> None:
+    """HOME-less process (systemd without User=): expanduser's RuntimeError
+    must not escape past load_env()'s "raises EnvError" contract."""
+
+    def boom(self: Path) -> Path:
+        raise RuntimeError("Could not determine home directory for current user")
+
+    monkeypatch.setattr(Path, "expanduser", boom)
+    setenv(OPENAI_API_KEY=VALID_KEY, DATA_DIR="~/somewhere")
+    with pytest.raises(EnvError, match="DATA_DIR: cannot resolve '~'"):
+        load_fresh()
+
+
+def test_field_defaults_and_validator_share_one_source_of_truth() -> None:
+    """The field-default literals must stay derived from the DEFAULT_* consts
+    the before-validator uses (they were duplicated once; review #4)."""
+    assert EnvSettings.model_fields["data_dir"].default == Path(DEFAULT_DATA_DIRNAME)
+    assert EnvSettings.model_fields["config_dir"].default == Path(
+        DEFAULT_CONFIG_DIRNAME
+    )
+    assert EnvSettings.model_fields["database_path"].default == (
+        Path(DEFAULT_DATA_DIRNAME) / DEFAULT_DATABASE_FILENAME
+    )
 
 
 # --- dev-only switches ----------------------------------------------------------

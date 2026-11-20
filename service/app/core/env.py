@@ -8,9 +8,14 @@ live in ``config/*.yaml`` and are loaded by ``app/config`` (ADR-015) — never
 as environment variables. The field set below is a closed whitelist; the unit
 test pins it so new capability knobs cannot creep in here.
 
-Path semantics: ``REPO_ROOT`` defaults to the repository root; the other path
-variables are ``~``-expanded and, if relative, anchored at ``REPO_ROOT`` —
-the same rule config files use (plan §5).
+Path semantics: ``REPO_ROOT`` defaults to the repository root and, when set,
+must expand (``~``) to an **absolute** path — it anchors everything else.
+The other path variables are ``~``-expanded and, if relative, anchored at
+``REPO_ROOT`` — the same rule config files use (plan §5). Present-but-blank
+values are rejected rather than silently falling back to defaults. The
+repo-root ``.env`` is resolved at *call* time from the runtime ``REPO_ROOT``,
+not at import time, so relocating the deployment relocates the dotenv file
+with it.
 
 Notes:
 - ``SESSION_SECRET`` intentionally does not exist: sessions are opaque
@@ -22,16 +27,25 @@ Notes:
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError, field_validator, model_validator
+from pydantic_core import PydanticCustomError  # re-export home in pydantic v2
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Repo root as seen from a normal checkout: service/app/core/env.py -> up 3.
 # Overridable via REPO_ROOT for packaging layouts that move the data dir.
 REPO_ROOT: Path = Path(__file__).resolve().parents[3]
+
+# Default layout below the repo root (plan §11 `./data/`; §5 `config/`).
+# Single source of truth for both the field defaults (documentation/mypy) and
+# the before-validator that actually fills them (review finding #4).
+DEFAULT_DATA_DIRNAME = "data"
+DEFAULT_CONFIG_DIRNAME = "config"
+DEFAULT_DATABASE_FILENAME = "vanilla.db"
 
 # Default sandbox image, built by `make sandbox-build` (plan §11).
 DEFAULT_SANDBOX_IMAGE = "vanilla-agent/sandbox:latest"
@@ -64,9 +78,30 @@ class EnvError(ValueError):
     """
 
 
-def _expand(raw: str | Path, root: Path) -> Path:
-    """`~`-expand *raw*; anchor relative paths at *root*."""
-    p = Path(raw).expanduser()
+def _env_error(msg: str) -> PydanticCustomError:
+    """Model-level validation error carrying an exact, prefixed message."""
+    return PydanticCustomError("deployment_env", "{msg}", {"msg": msg})
+
+
+def _safe_expanduser(raw: str | Path, name: str) -> Path:
+    """`Path.expanduser` that reports an unresolvable HOME as a validation
+    error (raising RuntimeError out of load_env() would break its contract —
+    e.g. systemd units without User= have no HOME)."""
+    try:
+        return Path(raw).expanduser()
+    except RuntimeError as exc:
+        raise _env_error(f"{name}: cannot resolve '~' ({exc})") from None
+
+
+def _expand(raw: str | Path, root: Path, name: str) -> Path:
+    """Expand `~` in *raw*, then anchor relative results at *root*.
+
+    Rejects present-but-blank values: an empty deployment path is a typo in
+    `.env`, not a request for the default (that is what unsetting is).
+    """
+    if not str(raw).strip():
+        raise _env_error(f"{name} must not be empty")
+    p = _safe_expanduser(raw, name)
     return p if p.is_absolute() else root / p
 
 
@@ -89,11 +124,12 @@ class EnvSettings(BaseSettings):
     # The declared defaults below are documentation only: _resolve_path_defaults
     # (a before-validator) always injects fully-anchored values into the input,
     # so these literals never reach a constructed instance. They exist so
-    # type-checkers accept the no-arg constructor that env-magic performs.
+    # type-checkers accept the no-arg constructor that env-magic performs, and
+    # they are built from the same DEFAULT_* constants the validator uses.
     repo_root: Path = REPO_ROOT
-    data_dir: Path = Path("data")
-    config_dir: Path = Path("config")
-    database_path: Path = Path("data/vanilla.db")
+    data_dir: Path = Path(DEFAULT_DATA_DIRNAME)
+    config_dir: Path = Path(DEFAULT_CONFIG_DIRNAME)
+    database_path: Path = Path(DEFAULT_DATA_DIRNAME) / DEFAULT_DATABASE_FILENAME
 
     # --- provider credentials (the single global key, plan §13-D2) ----------
     openai_api_key: str
@@ -120,13 +156,33 @@ class EnvSettings(BaseSettings):
         if not isinstance(data, dict):
             return data
         values = dict(data)
-        root = Path(values.get("repo_root", REPO_ROOT)).expanduser()
+        if "repo_root" in values:
+            raw_root = values["repo_root"]
+            # Check the raw string: Path("") collapses to Path(".") and would
+            # otherwise be misreported as "relative" instead of "empty".
+            if not str(raw_root).strip():
+                raise _env_error("REPO_ROOT must not be empty")
+            root = _safe_expanduser(raw_root, "REPO_ROOT")
+            if not root.is_absolute():
+                # It anchors every other relative path; anchoring it at CWD
+                # would silently move the whole deployment with the launch dir.
+                raise _env_error(
+                    f"REPO_ROOT must be an absolute path (got relative {str(root)!r})"
+                )
+        else:
+            root = REPO_ROOT
         values["repo_root"] = root
-        values["data_dir"] = _expand(values.get("data_dir", "data"), root)
-        values["config_dir"] = _expand(values.get("config_dir", "config"), root)
+        values["data_dir"] = _expand(
+            values.get("data_dir", DEFAULT_DATA_DIRNAME), root, "DATA_DIR"
+        )
+        values["config_dir"] = _expand(
+            values.get("config_dir", DEFAULT_CONFIG_DIRNAME), root, "CONFIG_DIR"
+        )
         db = values.get("database_path")
         values["database_path"] = (
-            _expand(db, root) if db else values["data_dir"] / "vanilla.db"
+            _expand(db, root, "DATABASE_PATH")
+            if db is not None
+            else values["data_dir"] / DEFAULT_DATABASE_FILENAME
         )
         return values
 
@@ -152,25 +208,55 @@ class EnvSettings(BaseSettings):
         return v
 
 
+class _Auto:
+    """Sentinel: resolve the dotenv location at call time (see load_env)."""
+
+
+AUTO_DOTENV: Any = _Auto()
+
+
+def _default_dotenv_path() -> Path:
+    """The `.env` lives next to the *runtime* REPO_ROOT, not the import-time one.
+
+    Resolution is best-effort by design: an unreadable/odd REPO_ROOT yields no
+    dotenv, and the real diagnosis comes from field validation, not here.
+    """
+    raw = os.environ.get("REPO_ROOT", "")
+    if raw.strip():
+        try:
+            root = Path(raw).expanduser()
+        except RuntimeError:
+            return REPO_ROOT / ".env"
+        if root.is_absolute():
+            return root / ".env"
+    return REPO_ROOT / ".env"
+
+
 @lru_cache(maxsize=1)
-def load_env() -> EnvSettings:
+def load_env(*, dotenv_path: Path | None | _Auto = AUTO_DOTENV) -> EnvSettings:
     """Build :class:`EnvSettings` from the process environment, fail-fast.
 
     All problems are reported at once (pydantic collects them), matching the
     collect-don't-fail-on-first style used across the config layer (T1.2).
+    Args:
+        dotenv_path: ``AUTO_DOTENV`` (default) reads ``<runtime REPO_ROOT>/.env``;
+            ``None`` disables the dotenv source (tests); a ``Path`` pins it.
     Raises:
         EnvError: one line per problem; never contains variable values.
     """
+    resolved = _default_dotenv_path() if isinstance(dotenv_path, _Auto) else dotenv_path
     try:
         # openai_api_key is env-provided at runtime; mypy cannot see the
-        # pydantic-settings source, so it flags the no-arg call. Keeping the
+        # pydantic-settings source, so it flags the no-data call. Keeping the
         # field required (rather than defaulting it) is the fail-fast itself.
-        return EnvSettings()  # type: ignore[call-arg]
+        return EnvSettings(_env_file=resolved)  # type: ignore[call-arg]
     except ValidationError as exc:
         lines = []
         for err in exc.errors():
-            loc = ".".join(str(part) for part in err["loc"]) or "<input>"
-            lines.append(f"{loc.upper()}: {err['msg']}")
+            loc = ".".join(str(part) for part in err["loc"])
+            # Model-level errors (path anchoring) carry the variable name in
+            # their message already; field errors get the NAME: prefix.
+            lines.append(f"{loc.upper()}: {err['msg']}" if loc else err["msg"])
         raise EnvError(
             "invalid deployment environment:\n  " + "\n  ".join(lines)
         ) from None
