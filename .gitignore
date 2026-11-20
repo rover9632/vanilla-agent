@@ -1,0 +1,31 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# env / 本机配置：可能含明文 provider key，永不入库（docs/plan.md §8.6）
+.env
+.env.*
+config/*.local.yaml
+
+# 运行时数据：sqlite(+WAL/-shm)、tool 输出 artifact、每用户 workspace、备份。
+# 里面是 pw_hash / session token_hash / 对话正文 / agent 产物，误提交即泄露。
+/data/
+*.db
+*.db-shm
+*.db-wal
+# 将来若需要把测试用 DB fixture 入库，在此加精确反选：!service/tests/fixtures/....db
+
+# web
+web/node_modules/
+web/.next/
+web/out/
+web/next-env.d.ts
+*.tsbuildinfo
+
+# os / editor
+.DS_Store
+*.swp
