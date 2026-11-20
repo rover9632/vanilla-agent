@@ -6,7 +6,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# env / 本机配置：可能含明文 provider key，永不入库（docs/plan.md §8.6）
+# env / 本地部署覆盖：可能含明文 provider key，永不入库（docs/plan.md §8.6）
 .env
 .env.*
 config/*.local.yaml

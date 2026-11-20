@@ -7,6 +7,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - Never edit `.env` or `.env.local` (secret files); update `.env.example` instead, and never print secret values from them.
 - Commit messages carry NO `Co-Authored-By` or similar attribution trailers.
+- Do not automatically commit, amend, squash, rebase, or push commits without my explicit authorization.
+- Keep repository files publishable: no machine-local facts in tracked files (see "Documentation privacy and portability").
+- Record decisions and portable requirements in repo files; keep decision rationale, investigation narratives, and review post-mortems in the conversation.
+
+
+## Documentation privacy and portability
+
+Anything committed may be read by people who have never seen this machine. Tracked files — including `docs/plan.md`, code comments, and commit messages — must not contain:
+
+- hostnames, usernames, absolute paths outside the repo, or home-directory locations;
+- IP addresses (including observed gateway / LAN / link-local / metadata addresses), network topology, or firewall details;
+- resource specs of this box (RAM/CPU/core counts, disk sizes) or versions probed from it;
+- local package-registry or container-registry mirror URLs, local image/container/tag names, local file names of unrelated projects;
+- secret values, even partially redacted.
+
+Write the **decision and the portable rule**, not the observation. `openai>=3.51` and `max_live_containers: 8` (sized as `containers × per-container memory ≲ 1/3 of host RAM`) carry no fingerprint; "measured here: that host timed out" does. Environment specifics belong in untracked files (`.env`, `config/*.local.yaml`) or the deploy host's own config, referenced from docs by variable name only.
+
+When a fact genuinely requires an environment-dependent number, state it as a default plus the principle for recomputing it, and name the TODO/section that revalidates it on deploy. Before committing doc changes, grep them for the categories above.
 
 
 ## Planning and Task Management
