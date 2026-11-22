@@ -28,6 +28,13 @@ web/out/
 web/next-env.d.ts
 *.tsbuildinfo
 
+# coverage / 测试产物：跑 `pytest --cov` 后即出现的未跟踪垃圾（T0.4 hygiene 断言）。
+# 瞬时产物，永不入库。
+.coverage
+.coverage.*
+htmlcov/
+cov.json
+
 # os / editor
 .DS_Store
 *.swp
