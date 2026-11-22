@@ -21,7 +21,13 @@ dev = [
     # starlette's TestClient is built on httpx — required for tests, not a transitive accident.
     "httpx>=0.27",
     "ruff>=0.17.6",
-    "mypy>=2.4.1",
+    # Static type-check gate (docs/plan.md §10). Replaced mypy: the editor-side
+    # checker is already Pyright, one gate = one truth. Reproducibility note:
+    # the pip `pyright` package is a shim that fetches the npm payload at
+    # first install (needs network once, at `uv sync` time; Node not required
+    # on the runtime path afterwards). uv.lock pins the shim, not the npm
+    # tarball hash.
+    "pyright>=1.1.414",
     "pytest-asyncio>=1.5.0",
     "pytest-cov>=7.1.0",
     "jsonschema>=4.26.0",
@@ -29,6 +35,18 @@ dev = [
 
 [tool.uv]
 package = false
+
+[tool.pyright]
+# Explicit config so behavior does not drift with pyright's changing defaults.
+# §10 policy: start at `standard`, tighten toward `strict` as milestones land
+# (the old mypy gate used the same gradual-tightening plan).
+include = ["app", "tests"]
+typeCheckingMode = "standard"
+# Lets a bare `pyright` invocation (outside `uv run`) find the project venv;
+# `uv run pyright` resolves it automatically. Editor-side interpreters use
+# their own Python selection.
+venvPath = "."
+venv = ".venv"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

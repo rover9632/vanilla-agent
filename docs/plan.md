@@ -576,7 +576,7 @@ SSE 细节：
 | MCP | 官方 SDK 的 in-memory/stdio 示例 server 作 fixture |
 | API/e2e | `httpx.AsyncClient(transport=ASGITransport)` + 内存 SSE 解析器，覆盖"发消息→工具→审批→终态→断线重放" |
 | 前端 | `vitest`（reducer/store/sse 解帧）+ `tsc --noEmit` strict；Playwright 冒烟视时间在 M13 决定 |
-| 静态 | `ruff check` + `ruff format --check` + `mypy app`（strict 逐步收紧）；`make gen-ts` 漂移即失败；`make config-check` 纳入 lint 目标 |
+| 静态 | `ruff check` + `ruff format --check` + **`pyright`**（2026-11-22 定案替换 mypy：编辑器与门同源；`[tool.pyright]` standard 起步、向 strict 逐步收紧；include=app+tests 比原 `mypy app` 覆盖面更大。复现性注意：pip `pyright` 是 shim，npm 载荷不在 uv.lock 哈希内，`uv sync` 时需网络一次；Node 本就是 web 侧硬依赖）；`make gen-ts` 漂移即失败；`make config-check` 纳入 lint 目标 |
 | 覆盖目标 | `config/`、`agent/`、`permissions/`、`sandbox/`、`workspace/paths.py`、`auth/` ≥ 85%；§3 不变量每条 ≥1 用例（含第 7 条"零配置写入"用 grep 式守卫测试） |
 | 回归护栏 | 每个 bug 先加失败用例；本文件验证列写具体命令，避免"看起来能跑" |
 
@@ -675,4 +675,5 @@ docker compose up   # 生产形态：service + web（config 目录只读挂载�
 - **2026-11-20 r3.3 / T0.2 ✅**：`app/core/env.py` 部署面 env 收口（白名单 + fail-fast + 路径锚定 `REPO_ROOT` + `.env` 装载）。验证见 T0.2 行。
 - **2026-11-22 r3.4 / T0.3 ✅**：M0 基础设施四件套 `app/core/{ids,clock,errors,logging}.py`（UUIDv7 单调 id / 可注入时钟 / AppError 层级与 HTTP 信封 handler / 结构化 JSON 日志 + request id + secret 脱敏）。验证见 T0.3 行。衍生事项已并入 T0.4（`.gitignore` 补 coverage 产物）。
 - **2026-11-22 r3.5 / T0.4 ✅**：仓库根 `Makefile`（lint/test/dev/config-check/sandbox-build/gen-ts，未来目标带守卫）+ `tests/unit/test_repo_hygiene.py` 三层卫生断言 + `.gitignore` 补 coverage 产物。验证见 T0.4 行。
+- **2026-11-22 r3.6**：静态类型门 **mypy → pyright**（用户定案）：dev 依赖替换、`[tool.pyright]`（standard 模式，include=app+tests）、Makefile lint 目标跟随；现库两目录 0 错误。理由与复现性注意见 §10 静态行。历史 TODO 验证栏中的 mypy 记录不改写（那是当时实际执行的命令）。
 - **待办**：M0 剩余 T0.5；开放问题见 §13.2。

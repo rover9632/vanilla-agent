@@ -21,7 +21,7 @@ SANDBOX_IMAGE ?= vanilla-agent/sandbox:latest
 .PHONY: help lint format test dev config-check sandbox-build gen-ts
 
 help:
-	@echo "lint           ruff check + ruff format --check + mypy app + config-check"
+	@echo "lint           ruff check + ruff format --check + pyright + config-check"
 	@echo "test           pytest -q（容忍'尚无测试'的退出码 5；tests/ 非空后以真实结果判定）"
 	@echo "dev            运行已就绪的进程：uvicorn :8000 与 next dev :3000（守卫见上）"
 	@echo "config-check   配置校验 + 密钥扫描（T1.6；未落地时 SKIP）"
@@ -31,7 +31,7 @@ help:
 lint:
 	cd service && $(UV) run ruff check .
 	cd service && $(UV) run ruff format --check .
-	cd service && $(UV) run mypy app
+	cd service && $(UV) run pyright
 	$(MAKE) --no-print-directory config-check
 
 format:
