@@ -38,6 +38,11 @@ findings. Contract highlights (docs/plan.md §4/§5):
 - YAML is parsed with ``SafeLoader`` only (never a constructor-capable
   loader), duplicate mapping keys are an error instead of yaml's silent
   last-wins, and a document must be a single top-level mapping.
+- ``*.local.yaml`` deployment overrides (T1.4, plan §5) are discovered by
+  :func:`load_local_overlays`: only when the caller explicitly enables them
+  (the ``CONFIG_ALLOW_LOCAL`` wiring), and one such file *replaces* its
+  target document wholesale; a stray ``foo.local.yaml`` that targets no
+  known stem is an error, never a guess.
 
 The API is synchronous and side-effect-free (pure filesystem reads); T1.3's
 ``load_config()`` wraps it into the async contract of §4 and feeds the
@@ -83,6 +88,14 @@ CONFIG_FILES: Final[tuple[tuple[str, type[BaseModel], bool], ...]] = (
     ("mcp.yaml", MCPConfig, False),
     ("plugins.yaml", PluginsConfig, False),
 )
+
+#: Suffix of the optional deployment override documents (plan §5).
+LOCAL_SUFFIX: Final = ".local.yaml"
+
+#: stem (``settings``...) -> root model; drives overlay target resolution.
+_ROSTER_BY_STEM: Final[dict[str, type[BaseModel]]] = {
+    filename.removesuffix(".yaml"): model_cls for filename, model_cls, _ in CONFIG_FILES
+}
 
 # ---------------------------------------------------------------------------
 # ${env:...} reference machinery
@@ -201,7 +214,7 @@ class _MissingFile:
 _MISSING_FILE: Final = _MissingFile()
 
 
-def _display_name(path: Path, config_dir: Path, repo_root: Path) -> str:
+def display_name(path: Path, config_dir: Path, repo_root: Path) -> str:
     """Shortest honest reference: repo-relative when the config dir lives in
     the repo, else config-relative — §4's ``source`` shape. A *path* is
     always ``config_dir/filename``, so the second form cannot fail."""
@@ -410,7 +423,7 @@ def _validate_model(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_repo_relative(repo_root: Path, value: str) -> str:
+def resolve_repo_relative(repo_root: Path, value: str) -> str:
     """Lexical join + normalization (no filesystem access, no symlink
     resolution — that threat model is T1.7's). An absolute *value* replaces
     the root on join (pathlib semantics), so it fails containment downstream
@@ -418,9 +431,10 @@ def _resolve_repo_relative(repo_root: Path, value: str) -> str:
     return os.path.normpath(str(PurePosixPath(str(repo_root)) / value))
 
 
-def _contained_in(normalized: str, base: str) -> bool:
-    base = base.rstrip("/") or "/"
-    return normalized == base or normalized.startswith(base + "/")
+def path_within(base: str | Path, normalized: str) -> bool:
+    """True iff the already-normalized *normalized* sits at/under *base*."""
+    b = os.path.normpath(str(base)).rstrip("/") or "/"
+    return normalized == b or normalized.startswith(b + "/")
 
 
 def _path_containment_issues(
@@ -434,8 +448,8 @@ def _path_containment_issues(
     base = os.path.normpath(str(config_dir))
     if loaded.plugins is not None:
         for index, plugin in enumerate(loaded.plugins.plugins):
-            resolved = _resolve_repo_relative(repo_root, plugin.path)
-            if not _contained_in(resolved, base):
+            resolved = resolve_repo_relative(repo_root, plugin.path)
+            if not path_within(base, resolved):
                 issues.append(
                     ConfigIssue.error(
                         source_of["plugins.yaml"],
@@ -449,8 +463,8 @@ def _path_containment_issues(
         for index, hook in enumerate(loaded.hooks.hooks):
             if hook.kind is not HookKind.COMMAND:
                 continue  # python targets are module:attr, not paths
-            resolved = _resolve_repo_relative(repo_root, hook.target)
-            if not _contained_in(resolved, base):
+            resolved = resolve_repo_relative(repo_root, hook.target)
+            if not path_within(base, resolved):
                 issues.append(
                     ConfigIssue.error(
                         source_of["hooks.yaml"],
@@ -463,19 +477,77 @@ def _path_containment_issues(
 
 
 # ---------------------------------------------------------------------------
-# Orchestration
+# Single-document ingestion (roster files and *.local.yaml share this path)
+# ---------------------------------------------------------------------------
+
+
+def _ingest_document(
+    *,
+    path: Path,
+    display: str,
+    model_cls: type[BaseModel],
+    env: Mapping[str, str],
+) -> tuple[Any | _MissingFile | None, list[ConfigIssue], tuple[str, str] | None]:
+    """read -> decode -> parse -> expand -> validate one document.
+
+    Returns ``(model, [], source)`` on success, ``(_MISSING_FILE, [], None)``
+    when absent, ``(None, issues, source)`` on any failure. ``source``
+    records the sha256 of every file whose bytes were actually read —
+    including broken ones: *which bytes* failed matters (T1.6 scans local
+    overlays for plaintext secrets whether or not they loaded).
+    """
+    raw, read_issue = _read_file(path)
+    if read_issue is not None:
+        return None, [ConfigIssue.error(display, "", read_issue.message)], None
+    if isinstance(raw, _MissingFile):
+        return _MISSING_FILE, [], None
+    assert raw is not None  # both read failure modes returned above
+    source = (display, hashlib.sha256(raw).hexdigest())
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return (
+            None,
+            [
+                ConfigIssue.error(
+                    display, "", f"file is not valid UTF-8 (byte offset {exc.start})"
+                )
+            ],
+            source,
+        )
+    data, parse_issues = _parse_yaml(text, display)
+    if parse_issues:
+        return None, parse_issues, source
+    expand_issues: list[ConfigIssue] = []
+    expanded = _expand_node(
+        data or {}, env=env, source=display, path="", issues=expand_issues
+    )
+    if any(issue.level == "error" for issue in expand_issues):
+        # Expansion failed: placeholders remain in `expanded`; validating it
+        # would only invent follow-on errors (fault isolation).
+        return None, expand_issues, source
+    model, validation_issues = _validate_model(model_cls, expanded, display)
+    if validation_issues:
+        return None, [*expand_issues, *validation_issues], source
+    assert model is not None  # validate_model's own pairing contract
+    return model, expand_issues, source
+
+
+# ---------------------------------------------------------------------------
+# Roster orchestration
 # ---------------------------------------------------------------------------
 
 
 def load_config_files(
     *, repo_root: Path, config_dir: Path, environ: Mapping[str, str] | None = None
 ) -> LoadedConfig:
-    """Read, expand, validate and collect one ``config/`` directory.
+    """Read, expand, validate and collect the six roster documents.
 
     Never raises for config problems — inspect :attr:`LoadedConfig.issues`
     and ``has_errors``. ``environ`` defaults to ``os.environ``; tests pass an
     explicit mapping for hermeticity. File stems map to attribute names
-    (``settings.yaml`` -> ``settings``).
+    (``settings.yaml`` -> ``settings``). Local overlays are a separate pass —
+    see :func:`load_local_overlays`.
     """
     env: Mapping[str, str] = os.environ if environ is None else environ
     issues: list[ConfigIssue] = []
@@ -486,15 +558,14 @@ def load_config_files(
     for filename, model_cls, required in CONFIG_FILES:
         stem = filename.removesuffix(".yaml")
         path = config_dir / filename
-        display = _display_name(path, config_dir, repo_root)
+        display = display_name(path, config_dir, repo_root)
         source_of[filename] = display
-
-        raw, read_issue = _read_file(path)
-        if read_issue is not None:
-            issues.append(ConfigIssue.error(display, "", read_issue.message))
-            models[stem] = None
-            continue
-        if isinstance(raw, _MissingFile):
+        model, file_issues, source = _ingest_document(
+            path=path, display=display, model_cls=model_cls, env=env
+        )
+        if source is not None:
+            sources.append(source)
+        if isinstance(model, _MissingFile):
             if required:
                 issues.append(
                     ConfigIssue.error(display, "", "required config file is missing")
@@ -511,40 +582,7 @@ def load_config_files(
                 )
                 models[stem] = model_cls.model_validate({})
             continue
-
-        assert raw is not None  # both failure modes returned above
-        digest = hashlib.sha256(raw).hexdigest()
-        sources.append((display, digest))
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            issues.append(
-                ConfigIssue.error(
-                    display, "", f"file is not valid UTF-8 (byte offset {exc.start})"
-                )
-            )
-            models[stem] = None
-            continue
-
-        data, parse_issues = _parse_yaml(text, display)
-        issues.extend(parse_issues)
-        if parse_issues:
-            models[stem] = None
-            continue
-
-        expand_issues: list[ConfigIssue] = []
-        expanded = _expand_node(
-            data or {}, env=env, source=display, path="", issues=expand_issues
-        )
-        issues.extend(expand_issues)
-        if any(issue.level == "error" for issue in expand_issues):
-            # Expansion failed: placeholders remain in `expanded`; validating
-            # it would only invent follow-on errors (fault isolation).
-            models[stem] = None
-            continue
-
-        model, validation_issues = _validate_model(model_cls, expanded, display)
-        issues.extend(validation_issues)
+        issues.extend(file_issues)
         models[stem] = model
 
     loaded = LoadedConfig(**models, issues=tuple(issues), sources=tuple(sources))
@@ -556,3 +594,95 @@ def load_config_files(
             **models, issues=(*issues, *containment), sources=tuple(sources)
         )
     return loaded
+
+
+# ---------------------------------------------------------------------------
+# *.local.yaml deployment overrides (T1.4; gated)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class OverlayBundle:
+    """What ``config/*.local.yaml`` contributed to one load.
+
+    ``overrides`` carries a stem only when the gate is enabled AND the file
+    ingested cleanly; every other case falls through to the base layer with
+    the reason in ``issues`` — error for broken or unknown-target files,
+    warning when the gate is closed. "Ignored" never means "silent".
+    ``sources`` follows the successfully overridden stems exactly.
+    """
+
+    overrides: Mapping[str, Any]
+    issues: tuple[ConfigIssue, ...]
+    sources: tuple[tuple[str, str], ...]
+
+
+def load_local_overlays(
+    *,
+    repo_root: Path,
+    config_dir: Path,
+    environ: Mapping[str, str] | None = None,
+    allow_local: bool = False,
+) -> OverlayBundle:
+    """Discover and ingest ``<stem>.local.yaml`` for the six roster stems.
+
+    A local file REPLACES its target document wholesale — deep YAML merging
+    is exactly the silent-override swamp ADR-015 exists to avoid. Union
+    resources (permission rules, hooks, MCP servers) therefore shed the
+    replaced document's entries by design; the replacement is visible in
+    ``sources`` and, at deployment, in file review.
+    """
+    env: Mapping[str, str] = os.environ if environ is None else environ
+    issues: list[ConfigIssue] = []
+    overrides: dict[str, Any] = {}
+    sources: list[tuple[str, str]] = []
+    # Roster-stem order first, filename as tiebreaker: sources/issue lists
+    # stay same-shaped with the base pass (determinism is contract).
+    stem_order = {stem: i for i, stem in enumerate(_ROSTER_BY_STEM)}
+    try:
+        candidates = sorted(
+            config_dir.glob(f"*{LOCAL_SUFFIX}"),
+            key=lambda p: (
+                stem_order.get(p.name[: -len(LOCAL_SUFFIX)], len(stem_order)),
+                p.name,
+            ),
+        )
+    except OSError:
+        candidates = []  # unreadable config dir: the base pass reports it loudly
+    for path in candidates:
+        stem = path.name[: -len(LOCAL_SUFFIX)]
+        display = display_name(path, config_dir, repo_root)
+        model_cls = _ROSTER_BY_STEM.get(stem)
+        if model_cls is None:
+            issues.append(
+                ConfigIssue.error(
+                    display,
+                    "",
+                    f"'{path.name}' targets no known config file (valid stems: "
+                    + ", ".join(sorted(_ROSTER_BY_STEM))
+                    + ") — local files replace a document, never add one",
+                )
+            )
+            continue
+        if not allow_local:
+            issues.append(
+                ConfigIssue.warning(
+                    display,
+                    "",
+                    "local override present but the CONFIG_ALLOW_LOCAL gate is "
+                    "disabled — ignored (plan §5)",
+                )
+            )
+            continue
+        model, file_issues, source = _ingest_document(
+            path=path, display=display, model_cls=model_cls, env=env
+        )
+        if file_issues or model is None or isinstance(model, _MissingFile):
+            issues.extend(file_issues)
+            continue  # broken overlay: base layer stays; the errors refuse load
+        overrides[stem] = model
+        assert source is not None
+        sources.append(source)
+    return OverlayBundle(
+        overrides=overrides, issues=tuple(issues), sources=tuple(sources)
+    )

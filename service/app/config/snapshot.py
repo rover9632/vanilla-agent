@@ -21,9 +21,12 @@ That invariant is bought with two deliberate mechanics, both enforced here:
 
 Cross-file consistency checks that only the assembled view can answer live
 in :meth:`ConfigSnapshot.validate` (§4's collect-don't-raise contract: it
-returns issues, never throws). Same-name-conflict detection and plugin
-contribution merging extend this method in T1.4; reference integrity
-(skills→tools etc.) in T1.6. The startup-only ``CONFIG_PERMISSIVE=1``
+returns issues, never throws). Since T1.4 the assembled view is the *merged*
+view: operator documents (with active ``*.local.yaml`` replacements applied)
+unioned with enabled-plugin contributions, provenance recorded per entry
+(:mod:`app.config.merge`); same-name conflicts across sources are merge
+errors. Reference integrity (skills→tools etc.) lands on ``validate`` in
+T1.6. The startup-only ``CONFIG_PERMISSIVE=1``
 escape hatch mentioned in §4 is deliberately NOT consumed here: refusing to
 boot is the startup wiring's policy (T1.8), not the snapshot builder's.
 
@@ -34,14 +37,25 @@ from :mod:`app.config.issue` so every layer shares one class object.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Final
 
 from app.config.issue import ConfigIssue
-from app.config.loader import LoadedConfig, load_config_files
+from app.config.loader import (
+    LoadedConfig,
+    OverlayBundle,
+    load_config_files,
+    load_local_overlays,
+)
+from app.config.merge import (
+    Origin,
+    PluginContribution,
+    merge_contributions,
+    operator_displays,
+)
 from app.config.schema import (
     HookConfig,
     MCPConfig,
@@ -58,7 +72,10 @@ __all__ = [
     "ConfigLoadError",
     "ConfigSnapshot",
     "ConfigStore",
+    "Origin",  # re-exported from app.config.merge (T1.4 provenance)
+    "PluginContribution",  # ditto (T12.5 produces these)
     "ReloadReport",
+    "assemble_snapshot",
     "load_config",
 ]
 
@@ -107,13 +124,41 @@ class ConfigSnapshot:
     #: Load-time findings that survived into a usable config (warnings).
     #: Error-level findings never reach a snapshot: loading refuses instead.
     issues: tuple[ConfigIssue, ...] = ()
+    #: Per-entry provenance for the three union resources (T1.4). Each
+    #: tuple aligns 1:1 with the corresponding merged entries; §4's
+    #: rule_source and the T12 hook audit trail read these labels.
+    rule_origins: tuple[Origin, ...] = ()
+    hook_origins: tuple[Origin, ...] = ()
+    mcp_origins: tuple[Origin, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Alignment is structural: no construction path (tests using
+        ``dataclasses.replace`` included) can desync provenance from its
+        entries."""
+        for name, origins, entries in (
+            ("rule", self.rule_origins, self.permissions.rules),
+            ("hook", self.hook_origins, self.hooks.hooks),
+            ("mcp server", self.mcp_origins, self.mcp.servers),
+        ):
+            if len(origins) != len(entries):
+                raise ValueError(
+                    f"{name}_origins must align 1:1 with the merged {name} "
+                    f"entries ({len(origins)} origins vs {len(entries)})"
+                )
 
     def source_for(self, filename: str) -> str:
-        """Display path of one roster file as recorded at load time, or the
-        default-layout spelling when the file was absent (§5 naming)."""
-        for name, _ in self.sources:
-            if name == filename or name.endswith("/" + filename):
-                return name
+        """Display path of the document that AUTHORED one roster stem.
+
+        When a ``*.local.yaml`` replacement won, findings about that stem
+        must point at the local file (it is what an operator would go edit),
+        not at the replaced base — so the local spelling is searched first.
+        Falls back to the default-layout name when the file was absent and
+        defaults were used (§5 naming)."""
+        stem = filename.removesuffix(".yaml")
+        for want in (f"{stem}.local.yaml", filename):
+            for name, _ in self.sources:
+                if name == want or name.endswith("/" + want):
+                    return name
         return f"config/{filename}"
 
     def validate(self) -> list[ConfigIssue]:
@@ -152,31 +197,66 @@ class ConfigSnapshot:
         return issues
 
 
-def snapshot_from_loaded(loaded: LoadedConfig, *, version: int) -> ConfigSnapshot:
-    """Build a snapshot from an error-free :class:`LoadedConfig`.
+def assemble_snapshot(
+    loaded: LoadedConfig,
+    overlays: OverlayBundle,
+    *,
+    contributions: Sequence[PluginContribution],
+    repo_root: Path,
+    config_dir: Path,
+    version: int,
+) -> ConfigSnapshot:
+    """Merge base layer + local replacements + plugin contributions into a
+    snapshot, refusing anything with error-level findings.
 
     Raises:
-        ConfigLoadError: the load carried error-level findings.
-        RuntimeError: programming error — the loader promised models that
-            are missing (cannot happen while ``has_errors`` is False).
+        ConfigLoadError: base load, overlay ingestion, merge, or cross-file
+            validation produced errors — the exception carries the COMPLETE
+            diagnosis across every stage and level.
+        RuntimeError: programming error — the loader promised a model that
+            is missing while reporting no error (cannot happen per
+            :class:`LoadedConfig`'s contract; guarded anyway).
     """
     if loaded.has_errors:
         raise ConfigLoadError(loaded.issues)
-    parts: dict[str, Any] = {}
+    finals: dict[str, Any] = {}
     for stem in ("settings", "tools", "permissions", "hooks", "mcp", "plugins"):
-        model = getattr(loaded, stem)
-        if model is None:  # defensive; LoadedConfig's contract rules it out
+        model = overlays.overrides.get(stem, getattr(loaded, stem))
+        if model is None:
             raise RuntimeError(
                 f"loader returned no {stem} model without an error issue"
             )
-        parts[stem] = model
-    return ConfigSnapshot(
+        finals[stem] = model
+    outcome = merge_contributions(
+        permissions=finals["permissions"],
+        hooks=finals["hooks"],
+        mcp=finals["mcp"],
+        plugins=finals["plugins"],
+        contributions=contributions,
+        displays=operator_displays(config_dir, repo_root, overlays.overrides),
+        repo_root=repo_root,
+        config_dir=config_dir,
+    )
+    all_issues = (*loaded.issues, *overlays.issues, *outcome.issues)
+    snapshot = ConfigSnapshot(
         version=version,
         loaded_at=get_clock().now(),
-        sources=loaded.sources,
-        issues=loaded.issues,
-        **parts,
+        sources=(*loaded.sources, *overlays.sources),
+        settings=finals["settings"],
+        tools=finals["tools"],
+        permissions=outcome.permissions,
+        hooks=outcome.hooks,
+        mcp=outcome.mcp,
+        plugins=finals["plugins"],
+        issues=tuple(i for i in all_issues if i.level == "warning"),
+        rule_origins=outcome.rule_origins,
+        hook_origins=outcome.hook_origins,
+        mcp_origins=outcome.mcp_origins,
     )
+    findings = (*all_issues, *snapshot.validate())
+    if any(i.level == "error" for i in findings):
+        raise ConfigLoadError(findings)
+    return snapshot
 
 
 async def load_config(
@@ -185,27 +265,41 @@ async def load_config(
     config_dir: Path | None = None,
     environ: Mapping[str, str] | None = None,
     version: int = 1,
+    allow_local: bool = False,
+    contributions: Sequence[PluginContribution] = (),
 ) -> ConfigSnapshot:
-    """Assemble one snapshot (§4's entry point): files -> expand -> models
-    -> cross-file validation, refusing anything with error findings.
+    """Assemble one snapshot (§4's entry point): base files -> local
+    replacements -> plugin contributions -> cross-file validation.
 
     ``config_dir`` defaults to ``<repo_root>/config`` (the §5 layout; the
-    deployment may relocate it via ``CONFIG_DIR``, wired in T1.8). File I/O
-    runs in a worker thread so a reload never blocks the event loop.
+    deployment may relocate it via ``CONFIG_DIR``, wired in T1.8).
+    ``allow_local`` is the ``CONFIG_ALLOW_LOCAL`` gate (env-wired T1.8);
+    ``contributions`` arrive from the plugin registrar (produced T12.5).
+    File I/O runs in worker threads so a reload never blocks the event
+    loop; assembly itself is pure.
     """
+    config = config_dir if config_dir is not None else repo_root / "config"
     loaded = await asyncio.to_thread(
         load_config_files,
         repo_root=repo_root,
-        config_dir=config_dir if config_dir is not None else repo_root / "config",
+        config_dir=config,
         environ=environ,
     )
-    snapshot = snapshot_from_loaded(loaded, version=version)
-    problems = snapshot.validate()
-    if any(i.level == "error" for i in problems):
-        # Carry the blocking findings AND the surviving warnings, so one
-        # exception holds the complete diagnosis.
-        raise ConfigLoadError((*snapshot.issues, *problems))
-    return snapshot
+    overlays = await asyncio.to_thread(
+        load_local_overlays,
+        repo_root=repo_root,
+        config_dir=config,
+        environ=environ,
+        allow_local=allow_local,
+    )
+    return assemble_snapshot(
+        loaded,
+        overlays,
+        contributions=contributions,
+        repo_root=repo_root,
+        config_dir=config,
+        version=version,
+    )
 
 
 @dataclass(frozen=True)
@@ -247,13 +341,20 @@ class ConfigStore:
         repo_root: Path,
         config_dir: Path | None = None,
         environ: Mapping[str, str] | None = None,
+        allow_local: bool = False,
+        contributions: Sequence[PluginContribution] = (),
     ) -> ConfigStore:
         """Initial store at version 1; raises :class:`ConfigLoadError` if the
         shipped config is not usable (the service must not start on top of
         it — permissive boot, if ever wanted, is the caller's decision)."""
         return cls(
             await load_config(
-                repo_root=repo_root, config_dir=config_dir, environ=environ, version=1
+                repo_root=repo_root,
+                config_dir=config_dir,
+                environ=environ,
+                version=1,
+                allow_local=allow_local,
+                contributions=contributions,
             )
         )
 
@@ -309,6 +410,8 @@ class ConfigStore:
         repo_root: Path,
         config_dir: Path | None = None,
         environ: Mapping[str, str] | None = None,
+        allow_local: bool = False,
+        contributions: Sequence[PluginContribution] = (),
     ) -> ReloadReport:
         """Re-read the config tree and swap it in iff fully green (§7's
         SIGHUP path). Never raises for config problems: even a load
@@ -323,6 +426,8 @@ class ConfigStore:
                     config_dir=config_dir,
                     environ=environ,
                     version=next_version,
+                    allow_local=allow_local,
+                    contributions=contributions,
                 )
             except ConfigLoadError as exc:
                 return ReloadReport(

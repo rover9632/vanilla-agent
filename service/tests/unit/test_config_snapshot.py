@@ -32,7 +32,9 @@ from app.config.issue import ConfigIssue as SharedConfigIssue
 from app.config.schema import (
     HookConfig,
     MCPConfig,
+    PermissionEffect,
     PermissionMode,
+    PermissionRule,
     PermissionsConfig,
     PluginsConfig,
     Settings,
@@ -424,10 +426,35 @@ async def test_config_issue_reexport_is_the_same_class() -> None:
     assert ConfigIssue is SharedConfigIssue
 
 
-def test_snapshot_from_loaded_defensive_on_missing_model() -> None:
-    from app.config.loader import LoadedConfig
-    from app.config.snapshot import snapshot_from_loaded
+def test_assemble_defensive_on_missing_model() -> None:
+    from app.config.loader import LoadedConfig, OverlayBundle
+    from app.config.snapshot import assemble_snapshot
 
     broken = LoadedConfig(settings=None)  # error-free by construction...
+    empty_overlays = OverlayBundle(overrides={}, issues=(), sources=())
     with pytest.raises(RuntimeError):
-        snapshot_from_loaded(broken, version=1)
+        assemble_snapshot(
+            broken,
+            empty_overlays,
+            contributions=(),
+            repo_root=Path("."),
+            config_dir=Path("."),
+            version=1,
+        )
+
+
+def test_snapshot_origins_alignment_is_structural() -> None:
+    # A misaligned construction path (here: hand-built provenance) is a
+    # programming error, refused at __post_init__, not a silent drift.
+    snap = _bare_snapshot(1)
+    with pytest.raises(ValueError, match="align 1:1"):
+        dataclasses.replace(
+            snap,
+            permissions=snap.permissions.model_copy(
+                update={
+                    "rules": [
+                        PermissionRule(effect=PermissionEffect.ASK, pattern="bash")
+                    ]
+                }
+            ),
+        )
