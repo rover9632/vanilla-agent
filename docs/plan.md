@@ -4,7 +4,7 @@
 > 规则（按 CLAUDE.md）：**每个 TODO 项需要单独审批后才能开工**；批准整体计划 ≠ 批准全部 TODO；一次只实现一个 TODO；实现后立即验证并回写状态。
 >
 > 状态标记：`⬜ 待办` `🔵 进行中` `✅ 完成（含验证）` `⚠️ 受阻`
-> 当前进度：**6 / 81 TODO 完成**（r3.7）。**M0 项目地基收官**（T0.1a/b、T0.2–T0.5 全部 ✅；T0.1c 已撤销见 ADR-007）。下一里程碑：M1 配置层。（README 索引链接经确认不加）
+> 当前进度：**7 / 81 TODO 完成**（r3.8）。**M0 已收官**；**M1 配置层进行中**：T1.1 ✅，下一项 T1.2（loader）。（README 索引链接经确认不加）
 >
 > **r2 变更（2026-11-20）**：skills / tools / subagents / MCP / plugins / permissions / hooks 全部改为**随项目版本管理的配置文件**，不入数据库、不提供服务端修改端点、用户不可改（ADR-015）。里程碑由 13 个增至 14 个（新增 M1 配置层），DB 表由 25 张减至 14 张（删除 11 张配置表）。
 >
@@ -424,7 +424,7 @@ SSE 细节：
 
 | ID | TODO | 验证 | 状态 |
 |---|---|---|---|
-| T1.1 | `app/config/schema.py`：`Settings/ToolConfig/PermissionsConfig/HookConfig/MCPConfig/PluginsConfig` 的 pydantic 模型（strict、`extra="forbid"`），以及共享的 skill/agent frontmatter 模型 | 单测：未知字段报错、类型/枚举校验、必填缺失报错清晰 | ⬜ |
+| T1.1 | `app/config/schema.py`：`Settings/ToolConfig/PermissionsConfig/HookConfig/MCPConfig/PluginsConfig` 的 pydantic 模型（strict、`extra="forbid"`），以及共享的 skill/agent frontmatter 模型 | 单测：未知字段报错、类型/枚举校验、必填缺失报错清晰 | ✅ 已验证：`app/config/schema.py`（六文件根模型 + `SkillFrontmatter`/`AgentFrontmatter`；统一 `MODEL_CONFIG = strict + extra=forbid + frozen`——frozen 从叶子起落实不变量 6）。**实现要点**：① pydantic 2.14 实测 strict 模式拒绝 `str→StrEnum`（按身份判），YAML 来源必然给 str，故每个枚举带 `*Input` 别名（`Field(strict=False)` 注在**最内层**：字段/列表元素/dict key 三处深度各有用例钉死），错误文案保持 `Input should be 'a' or 'b'`；int→float 加宽保留（YAML `cpus: 1`），数字字符串一律拒绝。② secret 面：`provider.api_key` 与 MCP server 的 `env`/`headers` 值为 `SecretStr`（repr/`model_dump(json)` 均 `**********`，用例断言密文不出现在 repr）；`${env:}` 由 T1.2 在**校验前**展开，模型只见实值。③ 枚举即词汇表：`PermissionMode`（含 camelCase `acceptEdits`）、`PermissionEffect`（**无 `always`**，ADR-009）、`NetworkMode`（**三档可表达、默认 `bridge` 不可表达**——用例专门断言 `"bridge"` 被拒，§8.4）、`HookEvent` 12 值按 T12.1 wire 名逐个钉死、`MCPTransport{stdio,streamable_http}`（transport 字段互斥：stdio 必填 command 且禁 url/headers，http 反之）。④ **内置工具目录是闭集**：`ToolCatalog` 一工具一字段（16 名，`BUILTIN_TOOL_NAMES` 由字段表派生并被用例钉死），tools.yaml 的键拼错=extra_forbidden 而非静默忽略；`TOOL_TIMEOUT_S_HARD_MAX`/`TOOL_RESULT_BYTES_HARD_MAX` 只声明不拒绝——**超限值必须能通过校验**，T6.1 的契约是"钳制+warning"，schema 先拒绝会让那条用例无从执行。⑤ 默认值=决策的落点：`network_mode=none`（D8）、`registration.open=true`+per-IP 5/h、10/日（§8.11）、`max_concurrent_runs=1`、`max_live_containers=8`（注释写明 §8.10b 重算原则，T1.5 复核）、hook `on_timeout=block`+`timeout_ms=10_000`、MCP `requires_approval=true`（新 server 先问后动）、`permissions.allowed_modes` 缺省**不含 bypass**（T1.1 自订：与 D8"最严即默认、放宽须显式"同姿态，已在此记录供评审）。provider 三必填字段（D1）+ `allowed_models` 缺省=None→`effective_allowed_models` 解析为 `(model_name,)`、显式给出必须包含 default（单文件内交叉校验）。⑥ 边界写明不越权：路径只查形状（绝对/`..`/反斜杠拒绝，存在性与越 config/ 归 T1.2/T1.7）；pattern 语法、引用完整性（skill→tools 等）、跨文件合并全部让位 T1.4/T1.6。`tests/unit/test_config_schema.py` **128 passed**：全模型未知字段扫掠、§5 字段名白名单逐模型钉死（防无声改名漂移，手法同 test_env 的 DEPLOY_ENV_VARS）、必填 loc+"Field required" 逐字段、范围/形状表驱动（temperature/top_p/retries/timeout_ms/domain/slug/memory spec…）、决策性默认值逐条、SecretStr 不回显、frozen 端到端、两份"真实文件"整档冒烟。门槛：`app/config` **statement 覆盖 100%**；全套 **296 passed**；`ruff check`/`format --check`/`pyright` 全绿；`make lint`/`make test` 从仓库根通过；隐私 grep 干净。`app/config/__init__.py` 就位（M1 各件落点索引） |
 | T1.2 | `app/config/loader.py`：读 `config/*.yaml`、`${env:VAR}` 展开（禁止 `${file:}`）、路径相对 `REPO_ROOT` 解析 + 禁止越出 `config/`、**收集式校验**（`ConfigIssue` 一次报全，不 fail-fast 于第一条） | 单测：缺 env 变量、越界路径、语法错、多问题一次性列出；fixture 目录覆盖 | ⬜ |
 | T1.3 | `app/config/snapshot.py`：`ConfigSnapshot`（version/sources sha256/合并后视图）+ `ConfigStore.swap()` 原子替换 + `RunContext.config` 引用旧快照语义 | 单测：reload 前后两个 run 各持自己快照；swap 失败保留旧快照；version 单调 | ⬜ |
 | T1.4 | 合并规则：`plugins/<name>` 资源贡献、`*.local.yaml` 覆盖门控、permission 并集 + deny 优先 + 插件禁声明 bypass、**同名冲突报 error**（skill slug / tool name / mcp server / hook matcher） | 单测：4 类冲突各报一条 error；local 覆盖在未开开关时被忽略 | ⬜ |
@@ -677,4 +677,5 @@ docker compose up   # 生产形态：service + web（config 目录只读挂载�
 - **2026-11-22 r3.5 / T0.4 ✅**：仓库根 `Makefile`（lint/test/dev/config-check/sandbox-build/gen-ts，未来目标带守卫）+ `tests/unit/test_repo_hygiene.py` 三层卫生断言 + `.gitignore` 补 coverage 产物。验证见 T0.4 行。
 - **2026-11-22 r3.6**：静态类型门 **mypy → pyright**（用户定案）：dev 依赖替换、`[tool.pyright]`（standard 模式，include=app+tests）、Makefile lint 目标跟随；现库两目录 0 错误。理由与复现性注意见 §10 静态行。历史 TODO 验证栏中的 mypy 记录不改写（那是当时实际执行的命令）。
 - **2026-11-23 r3.7 / T0.5 ✅（M0 收官）**：`docs/architecture.md` 成文并通过人工评审 —— plan 之外的稳定系统描述（形态/不变量/配置面/事件与 API 协议/安全姿态/边界契约），头部定义与 plan 的 drift 规则。M1 起：契约变更先改 plan，再同步 architecture.md。
-- **待办**：**M0 完成**；下一项 M1（T1.1 起）；开放问题见 §13.2。
+- **2026-11-23 r3.8 / T1.1 ✅**：`app/config/schema.py` 配置层字段词汇表（六文件根模型 + skill/agent frontmatter；strict+forbid+frozen；`*Input` 枚举别名；SecretStr；闭集工具目录与硬上限常量；决策性默认值 D8/§8.10/§8.11/ADR-007/009/010 落点）。验证细节见 T1.1 行。遗留评审点一条：`permissions.allowed_modes` 缺省不含 `bypass`（本项自订，同 D8 姿态）。
+- **待办**：M1 进行中；下一项 T1.2（loader）；开放问题见 §13.2。
