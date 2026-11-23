@@ -1,0 +1,6 @@
+# T1.2 fixture: the smallest settings.yaml that validates (provider's three
+# required fields, D1). All other sections fall back to schema defaults.
+provider:
+  base_url: https://llm.example.com/v1
+  api_key: sk-test-not-a-real-key
+  model_name: vanilla-mini

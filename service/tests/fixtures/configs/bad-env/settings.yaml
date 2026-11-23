@@ -1,0 +1,7 @@
+# T1.2 fixture: expansion failures — unset and empty (set-but-blank) env
+# vars. Both must error by NAME, and settings validation is then skipped
+# (fault isolation: the reported finding is the actionable one).
+provider:
+  base_url: https://llm.example.com/v1
+  api_key: "${env:VA_T12_UNSET}"
+  model_name: "${env:VA_T12_EMPTY}"

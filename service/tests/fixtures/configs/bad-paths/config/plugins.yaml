@@ -1,0 +1,7 @@
+# T1.2 fixture: the first path escapes the config dir (resolves to the repo's
+# web/ tree), the second stays inside — only plugins[0] may be reported.
+plugins:
+  - name: outside
+    path: web
+  - name: inside
+    path: config/plugins/inside

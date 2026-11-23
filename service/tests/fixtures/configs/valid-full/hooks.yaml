@@ -1,0 +1,13 @@
+# T1.2 fixture: one command hook (path stays inside the config dir) and one
+# python hook (module:attr, not path-checked).
+hooks:
+  - event: PreToolUse
+    matcher: bash
+    kind: command
+    target: hooks/guard.sh
+    timeout_ms: 5000
+    on_timeout: block
+  - event: Stop
+    kind: python
+    target: demo_plugin.hooks:on_stop
+    on_timeout: allow

@@ -1,0 +1,6 @@
+# T1.2 fixture: a command hook whose script lives outside config/ (plan §5:
+# hook scripts must stay inside the config directory).
+hooks:
+  - event: PreToolUse
+    kind: command
+    target: scripts/run.sh

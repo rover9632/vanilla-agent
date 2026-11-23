@@ -1,0 +1,7 @@
+# T1.2 fixture: two enum violations; `always` was removed from the effect
+# vocabulary by ADR-009 and must fail as an enum error at rules[1].effect —
+# the §4 example path shape.
+default_mode: turbo
+rules:
+  - { effect: allow, pattern: read_file }
+  - { effect: always, pattern: "bash(rm *)" }

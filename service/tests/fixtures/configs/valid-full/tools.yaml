@@ -1,0 +1,15 @@
+# T1.2 fixture: tools.yaml exercising defaults + per-tool entries.
+defaults:
+  timeout_s: 30
+  max_result_bytes: 32768
+tools:
+  write_file: { enabled: false }
+  edit_file: { enabled: false }
+  delete_file: { enabled: false }
+  move_file: { enabled: false }
+  bash:
+    hard_timeout_s: 120
+  http_fetch:
+    allowed_domains:
+      - docs.example.com
+      - "*.example.org"

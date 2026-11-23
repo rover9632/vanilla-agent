@@ -1,0 +1,6 @@
+# T1.2 fixture: valid sibling of the broken hooks.yaml below — proves the
+# syntax error does not take the whole load down (per-file isolation).
+provider:
+  base_url: https://llm.example.com/v1
+  api_key: sk-test-not-a-real-key
+  model_name: vanilla-mini

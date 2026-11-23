@@ -1,0 +1,5 @@
+# T1.2 fixture: broken YAML (unclosed flow sequence + dangling indent).
+hooks:
+  - event: PreToolUse
+    kind: command
+     target: [unclosed

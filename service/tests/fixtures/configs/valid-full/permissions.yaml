@@ -1,0 +1,11 @@
+# T1.2 fixture: permissions.yaml — policy, presets, rules (§4 shapes).
+default_mode: default
+policy:
+  disallow_bypass: true
+mode_presets:
+  plan:
+    - { effect: deny, pattern: write_file, note: plan is read-only }
+rules:
+  - { effect: deny, pattern: "bash(rm -rf *)", note: no recursive deletes }
+  - { effect: allow, pattern: read_file }
+  - { effect: ask, pattern: "mcp__fs-demo__*", source: reviewed-2026-11 }

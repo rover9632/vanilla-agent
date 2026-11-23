@@ -1,0 +1,6 @@
+# T1.2 fixture: repo-relative plugin path contained in the config dir.
+plugins:
+  - name: demo
+    path: plugins/demo
+    enabled: true
+    trusted: false

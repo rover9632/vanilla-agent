@@ -1,0 +1,4 @@
+# T1.2 fixture: typo'd builtin tool name — the closed ToolCatalog makes it
+# an error instead of a silently ignored entry.
+tools:
+  read_fiile: { enabled: false }

@@ -1,0 +1,6 @@
+# T1.2 fixture: ${file:...} is forbidden by name (plan §5).
+servers:
+  - name: leaky
+    transport: stdio
+    command: cat
+    args: ["${file:/etc/passwd}"]

@@ -1,0 +1,16 @@
+# T1.2 fixture: both transports, ${env:} secret expansion in env + headers.
+connect_timeout_s: 10
+servers:
+  - name: fs-demo
+    transport: stdio
+    command: mcp-server-fs
+    args: ["--verbose"]
+    env:
+      FS_TOKEN: "${env:VA_T12_MCP_TOKEN}"
+    requires_approval: true
+  - name: remote-demo
+    transport: streamable_http
+    url: https://mcp.example.com/rpc
+    headers:
+      Authorization: "Bearer ${env:VA_T12_MCP_TOKEN}"
+    enabled: false
