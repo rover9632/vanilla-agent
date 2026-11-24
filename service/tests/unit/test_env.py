@@ -23,7 +23,9 @@ from app.core.env import (
     REPO_ROOT,
     EnvError,
     EnvSettings,
+    default_dotenv_path,
     load_env,
+    read_dotenv,
 )
 
 VALID_KEY = "sk-test-not-a-real-key"
@@ -296,6 +298,47 @@ def test_session_ttl_bounds(setenv) -> None:
 def test_sandbox_image_override(setenv) -> None:
     setenv(OPENAI_API_KEY=VALID_KEY, SANDBOX_IMAGE="example.invalid/sandbox:dev")
     assert load_fresh().sandbox_image == "example.invalid/sandbox:dev"
+
+
+# --- LISTEN_ADDR (T1.6 consumer: config-check §8.11 gate) ---------------------------
+
+
+def test_listen_addr_default_none_and_passthrough(setenv) -> None:
+    setenv(OPENAI_API_KEY=VALID_KEY)
+    assert load_fresh().listen_addr is None  # undeclared: check warns, never guesses
+    setenv(LISTEN_ADDR=" 0.0.0.0:8000 ")
+    assert load_fresh().listen_addr == "0.0.0.0:8000"  # trimmed, not parsed here
+
+
+def test_listen_addr_present_but_blank_rejected(setenv) -> None:
+    setenv(OPENAI_API_KEY=VALID_KEY, LISTEN_ADDR="   ")
+    with pytest.raises(EnvError) as excinfo:
+        load_fresh()
+    assert "LISTEN_ADDR" in str(excinfo.value)
+
+
+# --- read_dotenv (audit helper; T1.6 typo detection) --------------------------------
+
+
+def test_read_dotenv_shape(tmp_path: Path) -> None:
+    f = tmp_path / ".env"
+    f.write_text(
+        '# comment\n\nexport OPENAI_API_KEY="sk-x"\n'
+        "SESSION_TTL_DAY=7\nBAD KEY=1\nnoequals\nSECRET_EXTRA = y \n",
+        encoding="utf-8",
+    )
+    got = read_dotenv(f)
+    assert set(got) == {"OPENAI_API_KEY", "SESSION_TTL_DAY", "SECRET_EXTRA"}
+    assert got["SESSION_TTL_DAY"] == "7"
+
+
+def test_read_dotenv_absent_file_is_empty(tmp_path: Path) -> None:
+    assert read_dotenv(tmp_path / "nothing.env") == {}
+
+
+def test_default_dotenv_path_honors_runtime_repo_root(setenv, tmp_path: Path) -> None:
+    setenv(REPO_ROOT=str(tmp_path))
+    assert default_dotenv_path() == tmp_path / ".env"
 
 
 # --- surface guards (pin the T0.2 boundary) ----------------------------------------

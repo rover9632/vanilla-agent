@@ -156,6 +156,32 @@ class _ConfigLoader(yaml.SafeLoader):
         return super().construct_mapping(node, deep=deep)
 
 
+def env_references_in(data: Any) -> set[str]:
+    """All ``${env:NAME}`` variable names appearing in parsed config data.
+
+    Audit view for config-check (T1.6): the placeholder filling shares this
+    function with nothing else, and because it re-uses ``_REF_RE``/
+    ``_ENV_NAME_RE`` the grammar has a single source of truth — an audit
+    that drifts from the expander is worse than no audit.
+    """
+    names: set[str] = set()
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+        elif isinstance(node, str):
+            for match in _REF_RE.finditer(node):
+                if match.group(1) == "env" and _ENV_NAME_RE.match(match.group(2)):
+                    names.add(match.group(2))
+
+    walk(data)
+    return names
+
+
 def _kind_name(value: Any) -> str:
     return {dict: "mapping", list: "sequence", type(None): "null"}.get(
         type(value), type(value).__name__

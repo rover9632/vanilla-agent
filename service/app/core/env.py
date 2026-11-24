@@ -28,6 +28,7 @@ Notes:
 from __future__ import annotations
 
 import os
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,11 @@ DEPLOY_ENV_VARS: frozenset[str] = frozenset(
         "ALLOW_LOCAL_SANDBOX",
         "CONFIG_ALLOW_LOCAL",
         "SANDBOX_IMAGE",
+        # Consumer: config-check's §8.11 open-registration listen gate
+        # (T1.6). Deployment declares its bind address here (systemd unit,
+        # T13.6, exports it next to uvicorn's --host) so the check can be
+        # deterministic instead of guessing.
+        "LISTEN_ADDR",
     }
 )
 
@@ -145,6 +151,24 @@ class EnvSettings(BaseSettings):
     # --- sandbox image reference ----------------------------------------------
     sandbox_image: str = DEFAULT_SANDBOX_IMAGE
 
+    # --- listen surface (consumer: T1.6 config-check §8.11 gate) ---------------
+    # Absent = "not declared": config-check warns (open registration is only
+    # safe behind loopback or an explicit declaration). A present-but-blank
+    # value is a typo, rejected like every other path/flag here.
+    listen_addr: str | None = None
+
+    @field_validator("listen_addr")
+    @classmethod
+    def _listen_addr_non_blank(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            raise _env_error(
+                "LISTEN_ADDR must not be empty (unset it to skip the listen check)"
+            )
+        return v
+
     @model_validator(mode="before")
     @classmethod
     def _resolve_path_defaults(cls, data: Any) -> Any:
@@ -215,7 +239,38 @@ class _Auto:
 AUTO_DOTENV: Any = _Auto()
 
 
-def _default_dotenv_path() -> Path:
+def read_dotenv(path: Path) -> dict[str, str]:
+    """Minimal KEY=VALUE audit view of a dotenv file (stdlib only).
+
+    Used by config-check (T1.6) to detect near-miss variable names — a
+    *file-shape audit*, not the loader of truth: the real environment is
+    built by pydantic-settings from the same file. Unreadable file returns
+    ``{}`` (absence is the normal repo state); malformed lines are skipped;
+    values are best-effort raw text (only key names and blankness matter
+    downstream). Never print the returned values: they may be secrets.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return {}
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export ") :].lstrip()
+        key, sep, value = stripped.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        out[key] = value.strip().strip("\"'")
+    return out
+
+
+def default_dotenv_path() -> Path:
     """The `.env` lives next to the *runtime* REPO_ROOT, not the import-time one.
 
     Resolution is best-effort by design: an unreadable/odd REPO_ROOT yields no
@@ -244,7 +299,7 @@ def load_env(*, dotenv_path: Path | None | _Auto = AUTO_DOTENV) -> EnvSettings:
     Raises:
         EnvError: one line per problem; never contains variable values.
     """
-    resolved = _default_dotenv_path() if isinstance(dotenv_path, _Auto) else dotenv_path
+    resolved = default_dotenv_path() if isinstance(dotenv_path, _Auto) else dotenv_path
     try:
         # openai_api_key is env-provided at runtime; mypy cannot see the
         # pydantic-settings source, so it flags the no-data call. Keeping the
