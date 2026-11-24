@@ -37,6 +37,7 @@ from :mod:`app.config.issue` so every layer shares one class object.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -65,6 +66,7 @@ from app.config.schema import (
     Settings,
     ToolConfig,
 )
+from app.config.trust import apply_trust
 from app.core.clock import get_clock
 
 __all__ = [
@@ -346,17 +348,32 @@ class ConfigStore:
     ) -> ConfigStore:
         """Initial store at version 1; raises :class:`ConfigLoadError` if the
         shipped config is not usable (the service must not start on top of
-        it — permissive boot, if ever wanted, is the caller's decision)."""
-        return cls(
-            await load_config(
-                repo_root=repo_root,
-                config_dir=config_dir,
-                environ=environ,
-                version=1,
-                allow_local=allow_local,
-                contributions=contributions,
-            )
+        it — permissive boot, if ever wanted, is the caller's decision).
+
+        The §8.7 trust boundary (T1.7) is enforced here and in
+        :meth:`reload` — the two plan-named "启动与 reload" points: an
+        owner/writability violation REFUSES the boot, with
+        ``CONFIG_ALLOW_LOCAL`` demoting every finding to a loud DEV MODE
+        warning instead of silently skipping the check."""
+        config = config_dir if config_dir is not None else repo_root / "config"
+        snapshot = await load_config(
+            repo_root=repo_root,
+            config_dir=config,
+            environ=environ,
+            version=1,
+            allow_local=allow_local,
+            contributions=contributions,
         )
+        trust = apply_trust(
+            snapshot, config_dir=config, repo_root=repo_root, allow_local=allow_local
+        )
+        if trust.errors:
+            raise ConfigLoadError(trust.errors)
+        if trust.warnings:
+            snapshot = dataclasses.replace(
+                snapshot, issues=(*snapshot.issues, *trust.warnings)
+            )
+        return cls(snapshot)
 
     @property
     def current(self) -> ConfigSnapshot:
@@ -417,7 +434,11 @@ class ConfigStore:
         SIGHUP path). Never raises for config problems: even a load
         refusal lands in the report, and the old snapshot stays
         authoritative. (Startup is different — :meth:`bootstrap` raises
-        :class:`ConfigLoadError` so the service refuses to boot.)"""
+        :class:`ConfigLoadError` so the service refuses to boot.)
+
+        The §8.7 trust boundary is re-probed here on EVERY reload — a
+        directory that went world-writable after boot can therefore not
+        sneak a config swap past the startup gate (T1.7)."""
         async with self._lock:
             next_version = self._current.version + 1
             try:
@@ -435,5 +456,24 @@ class ConfigStore:
                     previous_version=self._current.version,
                     version=None,
                     issues=exc.issues,
+                )
+            config = config_dir if config_dir is not None else repo_root / "config"
+            trust = apply_trust(
+                candidate,
+                config_dir=config,
+                repo_root=repo_root,
+                allow_local=allow_local,
+            )
+            if trust.errors:
+                # old snapshot stays authoritative; no version consumed
+                return ReloadReport(
+                    ok=False,
+                    previous_version=self._current.version,
+                    version=None,
+                    issues=trust.errors,
+                )
+            if trust.warnings:
+                candidate = dataclasses.replace(
+                    candidate, issues=(*candidate.issues, *trust.warnings)
                 )
             return self.swap(candidate)

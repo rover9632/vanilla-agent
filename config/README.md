@@ -47,6 +47,21 @@
 | 放宽松箱网络（D8） | `settings.yaml` `sandbox.network_mode` 改 `internal`/`per_user_bridge`——每一次开网络都要有记录地评审（§8.4 内网可达代价） | T6.4 三条硬断言 |
 | 沙箱镜像加依赖 | 改 `sandbox/image/Dockerfile` + `make sandbox-build`（运行期无网，装不了包，T6.3） | T6.3、T13.7③ |
 
+## 信任边界（§8.7，重要）
+
+`config/` 的写权限 == agent 能力授权。因此：
+
+- 启动与 reload 会检查本目录及其全部内容：任何条目 **world-writable** 或
+  **属主等于服务账号** 都直接拒绝启动（属主意味着随时可改权限，mode 位
+  救不了）。部署形态：只读挂载，或属主为另一个账号。
+- **开发机请显式带 `CONFIG_ALLOW_LOCAL=1` 启动**。此时上述发现全部降级为
+  `DEV MODE` 醒目告警——这是唯一的 dev 逃生阀，不存在
+  `CONFIG_TRUST_ON_STARTUP` 之类的第二个跳过开关。
+- `make config-check` 会把这些发现聚合成一条 warning（审计不拦门，执法在
+  启动路径），部署前把它读一遍。
+- command hook 脚本额外要求：存在、可执行、非 world-writable、路径不含
+  shell 元字符（argv 直传不经 shell，写出元字符本身就是事故信号）。
+
 ## 自检
 
 ```bash

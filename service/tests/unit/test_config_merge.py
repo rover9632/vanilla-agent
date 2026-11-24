@@ -44,6 +44,14 @@ from app.config.snapshot import (
 FAKE_KEY = "sk-test-not-a-real-key"
 
 
+@pytest.fixture(autouse=True)
+def _service_is_a_different_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One test here drives ConfigStore.bootstrap/reload — the T1.7 §8.7
+    gate compares file ownership with the service uid; tmp trees belong
+    to the runner. Enforcement lives in test_config_trust.py."""
+    monkeypatch.setattr("app.config.trust._current_uid", lambda: -1)
+
+
 def settings_body(model_name: str = "base-model") -> str:
     return f"""provider:
   base_url: https://llm.example.com/v1

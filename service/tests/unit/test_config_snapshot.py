@@ -55,6 +55,16 @@ FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "configs"
 FAKE_START = datetime(2026, 11, 23, 9, 0, 0, tzinfo=UTC)
 
 
+@pytest.fixture(autouse=True)
+def _service_is_a_different_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    """T1.7 isolation: the §8.7 gate compares file ownership against the
+    *service* uid. tmp trees belong to whoever runs pytest, and these
+    tests are about content/reload semantics — pretend the service runs
+    as a different account (the actual deploy posture; ownership
+    enforcement has its own test file)."""
+    monkeypatch.setattr("app.config.trust._current_uid", lambda: -1)
+
+
 def settings_body(model_name: str = "vanilla-mini") -> str:
     return f"""
 provider:

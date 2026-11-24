@@ -17,6 +17,7 @@ even the developer's real .env cannot leak into expectations).
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -36,6 +37,14 @@ SETTINGS_OK = """provider:
   api_key: "${env:T6_KEY}"
   model_name: test-model
 """
+
+
+@pytest.fixture(autouse=True)
+def _service_is_a_different_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Audit tests are about config CONTENT; the §8.7 ownership probe
+    would otherwise flag every tmp file (runner == owner). Enforcement has
+    its own tests in test_config_trust.py."""
+    monkeypatch.setattr("app.config.trust._current_uid", lambda: -1)
 
 
 def build_tree(tmp_path: Path, files: dict[str, str]) -> Path:
@@ -247,6 +256,9 @@ hooks:
     )  # present but manifest-less
     # make every declared thing exist -> clean
     write_resource(tree, "config/hooks/guard.sh", "#!/bin/sh\nexit 0\n")
+    # T1.7 trust audit joins the party: the spawnable script also needs
+    # its exec bit (argv-direct spawn, §8.7).
+    os.chmod(tree / "config/hooks/guard.sh", 0o755)
     for name in ("p-present", "p-missing"):
         manifest = tree / "config/plugins" / name / ".vanilla-plugin" / "plugin.json"
         manifest.parent.mkdir(parents=True, exist_ok=True)

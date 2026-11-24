@@ -78,6 +78,7 @@ from app.config.schema import (
     ToolCatalog,
 )
 from app.config.snapshot import ConfigLoadError, ConfigSnapshot, assemble_snapshot
+from app.config.trust import check_config_trust
 from app.core.env import DEPLOY_ENV_VARS, default_dotenv_path, read_dotenv
 
 #: Stand-in value for unset env references during the audit ONLY.
@@ -585,6 +586,41 @@ def _unknown_files(config_dir: Path) -> list[ConfigIssue]:
     return issues
 
 
+def _trust_audit_summary(findings: list[ConfigIssue]) -> ConfigIssue:
+    """One aggregated warning for the §8.7 audit surface.
+
+    Enforcement belongs to bootstrap/reload (ERROR-level, refuses); the
+    audit reports the same detector's findings as a single warning so
+    `make lint` on a developer box — where the developer, trivially, owns
+    the tree — shows the truth without a wall of per-entry lines.
+    """
+    buckets: dict[str, list[str]] = {}
+    order = [
+        "world-writable",
+        "owned by the service account",
+        "shell metacharacters",
+        "not executable",
+        "does not exist",
+        "cannot stat",
+        "config directory is missing",
+    ]
+    for finding in findings:
+        label = next((key for key in order if key in finding.message), "other")
+        buckets.setdefault(label, []).append(finding.source)
+    ordered_labels = order + [k for k in buckets if k not in order]
+    parts = "; ".join(
+        f"{label} ×{len(srcs)} ({', '.join(srcs[:2])}{'...' if len(srcs) > 2 else ''})"
+        for label in ordered_labels
+        if (srcs := buckets.get(label))
+    )
+    return ConfigIssue.warning(
+        "<trust>",
+        "",
+        f"§8.7 trust-boundary: {len(findings)} violation(s) — "
+        "startup/reload with CONFIG_ALLOW_LOCAL unset would REFUSE: " + parts,
+    )
+
+
 def _dotenv_typo_issues(keys: Iterable[str]) -> list[ConfigIssue]:
     """T0.2 leftover 5: near-miss deployment variable names in .env."""
     known = sorted(DEPLOY_ENV_VARS)
@@ -766,6 +802,11 @@ def run_config_check(
         issues.extend(
             _reference_issues(snapshot, config_dir=config, repo_root=repo_root)
         )
+        trust_findings = check_config_trust(
+            config, hooks=snapshot.hooks.hooks, repo_root=repo_root
+        )
+        if trust_findings:
+            issues.append(_trust_audit_summary(trust_findings))
         issues.extend(
             _listen_issues(
                 registration_open=snapshot.settings.registration.open,
