@@ -1,0 +1,11 @@
+# MCP server 清单（ADR-007，连接生命周期随 T11）：工具目录只活在内存里，
+# 不入库；启用一个 server = 改本文件 + kill -HUP。secret 一律 ${env:VAR}。
+# 示例（启用时解开注释）：
+# servers:
+#   - name: fs-demo
+#     transport: stdio
+#     command: mcp-server-filesystem
+#     args: ["--root", "config/mcp/fs-root"]
+#     requires_approval: true
+connect_timeout_s: 30
+servers: []

@@ -1,0 +1,59 @@
+# vanilla-agent 装配入口（ADR-015："agent 能做什么"进 git，"做了什么"进 DB）。
+# 改后自检：make config-check → 评审提交 → kill -HUP <pid>（无 HTTP reload 端点）。
+# secret 永不落这里：只允许 ${env:VAR} 引用进程环境变量（§8.6）。
+
+provider:
+  # §13-D1：只要 base_url / api_key / model_name + 通用参数；不接 Azure，
+  # 非 OpenAI 兼容的端点请自备转换网关（ADR-001）。
+  base_url: https://api.openai.com/v1
+  api_key: "${env:OPENAI_API_KEY}" # 全局唯一一把 key（§13-D2），花费隔离靠 limits 兜底
+  # 模型名是部署选择：这里给可运行的缺省占位，账户实际可用的模型用
+  # settings.local.yaml（CONFIG_ALLOW_LOCAL=1）或改动本文件后评审来覆盖。
+  model_name: gpt-4o-mini
+  temperature: 0.7
+  max_tokens: 4096
+  timeout_s: 120
+  retries: 2
+  # thread.model 必须落在这个集合里（§6）；缺省=只允许上面的默认模型。
+  allowed_models: [gpt-4o-mini]
+
+limits:
+  # —— per-run（§8.10）——
+  max_turns: 30
+  wall_clock_s: 1800
+  # —— per-user：注册时落库为默认配额，之后只能运维 CLI 改（§6 users 表）——
+  max_concurrent_runs: 1
+  per_user_daily_tokens: 200000
+  # —— 全局熔断（§8.10a）：单 key 架构下"各用户都不超限、合计烧穿账户"的闸门 ——
+  global_hourly_tokens: 2000000
+
+sandbox:
+  # ADR-005 §8.4 的执行限额。
+  memory: 2g
+  cpus: 1.0
+  pids_limit: 256
+  # D8：最严档是默认档——容器运行期零网络，工具链预烘焙进镜像（T6.3）。
+  # 放宽到 internal / per_user_bridge 必须改本文件 + kill -HUP：
+  # 每一次开网络都是一次有记录的配置变更。
+  network_mode: none
+  # 定值原则（§8.10b）：max_live_containers × memory ≲ 宿主可用内存的 1/3。
+  # 8×2g 是通用缺省；部署时按实际宿主复核（TODO：T1.6 config-check 报越界，
+  # T13.6 部署验收复算）。pip_index_url / apt_mirror / base_image / image_tag
+  # 是 build 期可选项（T6.3），需要镜像源代理的部署再显式声明。
+  max_live_containers: 8
+  idle_ttl_s: 900
+
+registration:
+  # §8.11：开放注册 + 沙箱 + 单 key 的组合风险由部署者显式承担——
+  # 监听非 loopback 且 open=true 时 make config-check 报 error（T1.6 落地）。
+  open: true
+  per_ip_rate: 5 # 每 IP 每小时注册请求数（与登录限速桶分开，§8.3/T3.4）
+  per_ip_daily: 10 # 每 IP 每日成功注册数
+
+permissions:
+  # 运行模式的可用集合在这里；默认规则集在 permissions.yaml。
+  default_mode: default
+  # bypass 不在缺省集合（与 D8 同姿态：最严即默认）。要开需同时：
+  # ① 这里加 bypass；② permissions.yaml 的 policy.disallow_bypass 保持
+  # false——否则 config-check / 快照校验直接拒绝（T1.3 跨文件检查）。
+  allowed_modes: [default, plan, acceptEdits]

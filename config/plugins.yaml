@@ -1,0 +1,5 @@
+# 插件（ADR-011，装配随 T12）：enabled 控制资源贡献是否进快照，trusted
+# 才允许进程内 Python entry point——两者都是需要评审的提交内容，不是
+# 运行时开关（系统里没有能点这个勾的角色）。path 相对仓库根且必须落在
+# config/ 内（T1.4 收束检查）。
+plugins: []

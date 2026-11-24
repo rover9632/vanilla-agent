@@ -1,0 +1,12 @@
+# Hooks（ADR-010，装配实现随 T12）：外部命令（stdin/stdout JSON，argv 直传
+# 不经 shell）与 trusted 插件 callable 两种形态。命令 target 必须是 config/
+# 目录内、非 world-writable 的脚本（§8.7，T1.7 校验）。
+# 示例（启用时解开注释）：
+# hooks:
+#   - event: PreToolUse
+#     matcher: bash
+#     kind: command
+#     target: hooks/approve-guard.sh
+#     timeout_ms: 10000
+#     on_timeout: block
+hooks: []

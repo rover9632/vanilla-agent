@@ -1,0 +1,21 @@
+# 权限规则（ADR-009）：pattern 语法的引擎校验在 T7.1；效果优先级
+# deny > ask > allow，不看特异性。这里只允许"改文件 + 评审 + reload"，
+# 运行时不存在能写它的角色（ADR-015，授权只有 once/session 两档）。
+default_mode: default
+policy:
+  # 运维硬约束：bypass 模式整体禁用。plugins.yaml/插件在类型上就表达不了
+  # bypass（T1.4），这里关掉的是 thread 侧入口；要开需显式改动 + reload，
+  # 且 settings.yaml 的 allowed_modes 必须同步不含 bypass 冲突（快照校验）。
+  disallow_bypass: true
+rules:
+  # 3 条示例，覆盖三种效果与 pattern 语法（T7.5 会把"我刚想允许 X"渲染成
+  # 可直接追加到本文件的建议片段）：
+  - effect: deny
+    pattern: "bash(rm -rf *)"
+    note: 递归删除永不执行——这不是"要不要审批"的问题
+  - effect: ask
+    pattern: "bash(git *)"
+    note: 最常见的 shell 操作也要确认；ask 是 bash 的默认，写成规则是示范语法
+  - effect: allow
+    pattern: read_file
+    note: 只读工具直通（无目标参数，工具名即可）
